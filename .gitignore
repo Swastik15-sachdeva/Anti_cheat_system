@@ -1,0 +1,12 @@
+# Backend
+backend/__pycache__/
+backend/.env
+backend/venv/
+backend/env/
+
+# Mac OS
+.DS_Store
+
+# Frontend is handled by ai-interview-frontend/.gitignore
+node_modules/
+dist/
