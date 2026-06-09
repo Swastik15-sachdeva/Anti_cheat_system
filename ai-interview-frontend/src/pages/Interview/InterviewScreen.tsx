@@ -3,6 +3,10 @@ import toast from "react-hot-toast";
 import { X } from "lucide-react";
 import { AiInterviewLayout, InterviewHeader, InterviewStage, TranscriptPanel, InterviewReport } from "./ui";
 import type { InterviewReportData } from "./ui/InterviewReport";
+import * as tf from "@tensorflow/tfjs";
+import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
+import * as cocoSsd from "@tensorflow-models/coco-ssd";
+import "@tensorflow/tfjs-backend-webgl";
 
 const MOCK_MESSAGES = [
   { role: "system", text: "Interview started", timestamp: new Date() },
@@ -19,56 +23,68 @@ export default function InterviewScreen() {
   const [reportData, setReportData] = useState<InterviewReportData | null>(null);
   const [isProcessingEnd, setIsProcessingEnd] = useState(false);
   
+  // Real-time proctoring states
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [detector, setDetector] = useState<any>(null);
+  const [cocoModel, setCocoModel] = useState<any>(null);
+  
+  const [faceWarning, setFaceWarning] = useState<string | null>(null);
+  const [gazeWarning, setGazeWarning] = useState<string | null>(null);
+  const [secondPersonWarning, setSecondPersonWarning] = useState<string | null>(null);
+  const [blurWarning, setBlurWarning] = useState<string | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   
+  // Ref tracking for throttling, history, and timestamps
+  const lastLoggedRef = useRef<{ [key: string]: number }>({});
+  const faceMissingStartRef = useRef<number | null>(null);
+  const gazeHistoryRef = useRef<number[]>([]);
+
   const formatTime = (s: number) => {
     const mins = Math.floor(s / 60);
     const secs = s % 60;
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
+  // 1. Initialize TFJS and load Models
   useEffect(() => {
-    // Demonstrate violation using Ram's custom UI toast
-    const timer = setTimeout(() => {
-      toast(
-        (t) => (
-          <div className="flex items-center justify-between gap-3 min-w-[200px]">
-            <span className="text-sm font-medium">Violation Detected: Looked Away</span>
-            <button
-              onClick={() => toast.dismiss(t.id)}
-              className="p-1 cursor-pointer rounded-full hover:bg-black/10 transition-colors text-gray-500 hover:text-gray-700"
-              title="Close"
-            >
-              <X size={16} strokeWidth={3} />
-            </button>
-          </div>
-        ),
-        {
-          duration: Infinity,
-          position: "top-center",
-          className: "toast-info-border",
-        }
-      );
-      
-      // Log violation to backend
-      fetch("http://localhost:3000/api/log-violation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: "mock-session-id",
-          type: "Looked Away",
-          timestamp: new Date().toISOString(),
-          screenshot_base64: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==" // Mock base64
-        })
-      }).catch(console.error);
+    let active = true;
+    async function loadModels() {
+      try {
+        console.log("Initializing TensorFlow...");
+        await tf.ready();
+        await tf.setBackend("webgl");
+        
+        console.log("Loading Face Mesh detector...");
+        const faceMeshModel = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
+        const faceDetector = await faceLandmarksDetection.createDetector(faceMeshModel, {
+          runtime: "tfjs",
+          refineLandmarks: true
+        });
 
-    }, 5000);
-    return () => clearTimeout(timer);
+        console.log("Loading COCO-SSD detector...");
+        const cocoDetector = await cocoSsd.load();
+
+        if (active) {
+          setDetector(faceDetector);
+          setCocoModel(cocoDetector);
+          setModelsLoaded(true);
+          console.log("Proctoring models loaded successfully.");
+        }
+      } catch (err) {
+        console.error("Error loading proctoring models:", err);
+        toast.error("Proctoring system failed to load. Running in offline mode.");
+      }
+    }
+    loadModels();
+    return () => {
+      active = false;
+    };
   }, []);
 
+  // 2. Camera Setup
   useEffect(() => {
-    // Turn on the user's camera
     async function setupCamera() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
@@ -82,13 +98,245 @@ export default function InterviewScreen() {
     setupCamera();
 
     return () => {
-      // Cleanup camera stream
       if (videoRef.current && videoRef.current.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach(track => track.stop());
       }
     };
   }, []);
+
+  // 3. Helper to capture frame screenshot
+  const captureScreenshot = (): string => {
+    if (!videoRef.current) return "";
+    const video = videoRef.current;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return "";
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.6); // compressed JPEG base64
+  };
+
+  // 4. Violation triggering and throttling (max once every 10s per violation type)
+  const triggerViolation = (type: string) => {
+    const now = Date.now();
+    const lastTime = lastLoggedRef.current[type] || 0;
+    if (now - lastTime < 10000) {
+      return; // Throttled
+    }
+    lastLoggedRef.current[type] = now;
+    const screenshot = captureScreenshot();
+
+    // Log to backend FastAPI
+    fetch("http://localhost:3000/api/log-violation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: "mock-session-id",
+        type: type,
+        timestamp: new Date().toISOString(),
+        screenshot_base64: screenshot
+      })
+    })
+    .then(res => {
+      if (!res.ok) console.error("Failed to log violation:", type);
+    })
+    .catch(console.error);
+
+    // Show proctoring toast warning
+    toast(
+      (t) => (
+        <div className="flex items-center justify-between gap-3 min-w-[200px]">
+          <span className="text-sm font-medium">Violation: {type}</span>
+          <button
+            onClick={() => toast.dismiss(t.id)}
+            className="p-1 cursor-pointer rounded-full hover:bg-black/10 transition-colors text-gray-500 hover:text-gray-700"
+            title="Close"
+          >
+            <X size={16} strokeWidth={3} />
+          </button>
+        </div>
+      ),
+      {
+        duration: 4000,
+        position: "top-center",
+        className: "toast-info-border",
+      }
+    );
+  };
+
+  // 5. Main Proctoring Detection Loop
+  useEffect(() => {
+    if (!modelsLoaded || !detector || !cocoModel || isInterviewComplete) {
+      return;
+    }
+
+    const intervalId = setInterval(async () => {
+      const video = videoRef.current;
+      if (!video || video.readyState !== 4 || video.paused || video.ended) {
+        return;
+      }
+
+      try {
+        let currentFaceWarning: string | null = null;
+        let currentGazeWarning: string | null = null;
+        let currentSecondPersonWarning: string | null = null;
+        let currentBlurWarning: string | null = null;
+
+        // Run face landmark detector
+        const faces = await detector.estimateFaces(video, { flipHorizontal: false });
+
+        if (!faces || faces.length === 0) {
+          if (faceMissingStartRef.current === null) {
+            faceMissingStartRef.current = Date.now();
+          }
+          const missingSec = (Date.now() - faceMissingStartRef.current) / 1000;
+          if (missingSec >= 4.0) {
+            currentFaceWarning = "Candidate Left Frame";
+            triggerViolation("Candidate Left Frame");
+          } else {
+            currentFaceWarning = "Face Missing from Frame";
+            triggerViolation("Face Missing from Frame");
+          }
+        } else {
+          // Face found, reset missing start
+          faceMissingStartRef.current = null;
+
+          // Multiple faces or person in background checks
+          if (faces.length >= 2) {
+            const sortedFaces = [...faces].sort((a, b) => {
+              const aArea = (a.box.width || 0) * (a.box.height || 0);
+              const bArea = (b.box.width || 0) * (b.box.height || 0);
+              return bArea - aArea;
+            });
+            const mainFaceArea = (sortedFaces[0].box.width || 1) * (sortedFaces[0].box.height || 1);
+            const secondaryFaceArea = (sortedFaces[1].box.width || 0) * (sortedFaces[1].box.height || 0);
+
+            if (secondaryFaceArea >= 0.45 * mainFaceArea) {
+              currentSecondPersonWarning = "Multiple Faces Detected";
+              triggerViolation("Multiple Faces Detected");
+            } else {
+              currentSecondPersonWarning = "Another Person in Background";
+              triggerViolation("Another Person in Background");
+            }
+          }
+
+          const mainFace = faces[0];
+          const bbox = mainFace.box;
+          const videoWidth = video.videoWidth || 640;
+          const videoHeight = video.videoHeight || 480;
+
+          // Check if partially hidden or off-screen
+          const margin = 15;
+          const isOffScreen = bbox.xMin < margin || 
+                             bbox.yMin < margin || 
+                             (bbox.xMax > videoWidth - margin) || 
+                             (bbox.yMax > videoHeight - margin);
+          const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.82);
+
+          if (isOffScreen || isLowConfidence) {
+            currentFaceWarning = "Face Partially Hidden";
+            triggerViolation("Face Partially Hidden");
+          }
+
+          // Gaze and Head Pose checks
+          const keypoints = mainFace.keypoints;
+          if (keypoints && keypoints.length >= 153) {
+            const kp = (idx: number) => keypoints[idx] || { x: 0, y: 0, z: 0 };
+            
+            // Yaw (looking left/right)
+            const leftCheek = kp(234);
+            const rightCheek = kp(454);
+            const nose = kp(4);
+            const d_left = Math.abs(nose.x - leftCheek.x);
+            const d_right = Math.abs(rightCheek.x - nose.x);
+            const yawRatio = d_left / (d_left + d_right || 1);
+
+            // Pitch (looking up/down)
+            const forehead = kp(10);
+            const chin = kp(152);
+            const d_up = Math.abs(nose.y - forehead.y);
+            const d_down = Math.abs(chin.y - nose.y);
+            const pitchRatio = d_up / (d_up + d_down || 1);
+
+            if (yawRatio < 0.35 || yawRatio > 0.65 || pitchRatio < 0.38 || pitchRatio > 0.75) {
+              currentGazeWarning = "Looked Away from Screen";
+              triggerViolation("Looked Away from Screen");
+            }
+
+            // Eye Shifting / Pupil tracking
+            let iris_left = keypoints[468];
+            let iris_right = keypoints[473];
+            if (!iris_left || !iris_right) {
+              const top_left = kp(159);
+              const bottom_left = kp(145);
+              const top_right = kp(386);
+              const bottom_right = kp(374);
+              iris_left = { x: (top_left.x + bottom_left.x) / 2, y: (top_left.y + bottom_left.y) / 2, z: 0 };
+              iris_right = { x: (top_right.x + bottom_right.x) / 2, y: (top_right.y + bottom_right.y) / 2, z: 0 };
+            }
+
+            const c_outer_left = kp(33);
+            const c_inner_left = kp(133);
+            const left_eye_width = Math.abs(c_inner_left.x - c_outer_left.x) || 1;
+            const gazeRatioLeft = Math.abs(iris_left.x - Math.min(c_outer_left.x, c_inner_left.x)) / left_eye_width;
+
+            const c_inner_right = kp(362);
+            const c_outer_right = kp(263);
+            const right_eye_width = Math.abs(c_outer_right.x - c_inner_right.x) || 1;
+            const gazeRatioRight = Math.abs(iris_right.x - Math.min(c_inner_right.x, c_outer_right.x)) / right_eye_width;
+
+            const avgGaze = (gazeRatioLeft + gazeRatioRight) / 2;
+            gazeHistoryRef.current.push(avgGaze);
+            if (gazeHistoryRef.current.length > 6) {
+              gazeHistoryRef.current.shift();
+            }
+
+            if (avgGaze < 0.32 || avgGaze > 0.68) {
+              currentGazeWarning = "Eye Shifting / Rapid Eye";
+              triggerViolation("Eye Shifting / Rapid Eye Movement");
+            } else {
+              // Check rapid transitions (REM)
+              let shiftsCount = 0;
+              const history = gazeHistoryRef.current;
+              for (let i = 1; i < history.length; i++) {
+                if (Math.abs(history[i] - history[i-1]) > 0.18) {
+                  shiftsCount++;
+                }
+              }
+              if (shiftsCount >= 3) {
+                currentGazeWarning = "Eye Shifting / Rapid Eye";
+                triggerViolation("Eye Shifting / Rapid Eye Movement");
+              }
+            }
+          }
+        }
+
+        // Run COCO-SSD object detector for cell phone presence
+        const predictions = await cocoModel.detect(video);
+        if (predictions && predictions.length > 0) {
+          const hasPhone = predictions.some((p: any) => 
+            (p.class === "cell phone" || p.class === "phone") && p.score >= 0.5
+          );
+          if (hasPhone) {
+            currentBlurWarning = "Cell Phone Detected";
+            triggerViolation("Cell Phone Detected");
+          }
+        }
+
+        setFaceWarning(currentFaceWarning);
+        setGazeWarning(currentGazeWarning);
+        setSecondPersonWarning(currentSecondPersonWarning);
+        setBlurWarning(currentBlurWarning);
+
+      } catch (err) {
+        console.error("Error in detection loop:", err);
+      }
+    }, 800);
+
+    return () => clearInterval(intervalId);
+  }, [modelsLoaded, detector, cocoModel, isInterviewComplete]);
 
   if (isInterviewComplete && reportData) {
     return (
@@ -122,13 +370,13 @@ export default function InterviewScreen() {
           isMuted={isMuted}
           isVideoOn={isVideoOn}
           videoRef={videoRef}
-          faceWarning={null}
-          blurWarning={null}
-          gazeWarning={null}
-          secondPersonWarning={null}
+          faceWarning={faceWarning}
+          blurWarning={blurWarning}
+          gazeWarning={gazeWarning}
+          secondPersonWarning={secondPersonWarning}
           showTour={false}
-          isLoading={false}
-          isInitializing={false}
+          isLoading={!modelsLoaded}
+          isInitializing={!modelsLoaded}
           isAiSpeaking={isAiSpeaking}
           isProcessing={isProcessingEnd}
           speechFailed={false}
