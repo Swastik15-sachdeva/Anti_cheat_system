@@ -10,6 +10,9 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  optimizeDeps: {
+    exclude: ['@mediapipe/face_mesh'],
+  },
   server: {
     port: 3001,
     strictPort: true,
