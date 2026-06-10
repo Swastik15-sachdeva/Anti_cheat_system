@@ -5,7 +5,6 @@ import { AiInterviewLayout, InterviewHeader, InterviewStage, TranscriptPanel, In
 import type { InterviewReportData } from "./ui/InterviewReport";
 import * as tf from "@tensorflow/tfjs";
 import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
-import * as cocoSsd from "@tensorflow-models/coco-ssd";
 import "@tensorflow/tfjs-backend-webgl";
 
 const MOCK_MESSAGES = [
@@ -26,7 +25,6 @@ export default function InterviewScreen() {
   // Real-time proctoring states
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [detector, setDetector] = useState<any>(null);
-  const [cocoModel, setCocoModel] = useState<any>(null);
   
   const [faceWarning, setFaceWarning] = useState<string | null>(null);
   const [gazeWarning, setGazeWarning] = useState<string | null>(null);
@@ -63,12 +61,8 @@ export default function InterviewScreen() {
           refineLandmarks: true
         });
 
-        console.log("Loading COCO-SSD detector...");
-        const cocoDetector = await cocoSsd.load();
-
         if (active) {
           setDetector(faceDetector);
-          setCocoModel(cocoDetector);
           setModelsLoaded(true);
           console.log("Proctoring models loaded successfully.");
         }
@@ -168,7 +162,7 @@ export default function InterviewScreen() {
 
   // 5. Main Proctoring Detection Loop
   useEffect(() => {
-    if (!modelsLoaded || !detector || !cocoModel || isInterviewComplete) {
+    if (!modelsLoaded || !detector || isInterviewComplete) {
       return;
     }
 
@@ -195,7 +189,7 @@ export default function InterviewScreen() {
           if (missingSec >= 4.0) {
             currentFaceWarning = "Candidate Left Frame";
             triggerViolation("Candidate Left Frame");
-          } else {
+          } else if (missingSec >= 1.5) {
             currentFaceWarning = "Face Missing from Frame";
             triggerViolation("Face Missing from Frame");
           }
@@ -313,16 +307,30 @@ export default function InterviewScreen() {
           }
         }
 
-        // Run COCO-SSD object detector for cell phone presence
-        const predictions = await cocoModel.detect(video);
-        if (predictions && predictions.length > 0) {
-          const hasPhone = predictions.some((p: any) => 
-            (p.class === "cell phone" || p.class === "phone") && p.score >= 0.5
-          );
-          if (hasPhone) {
-            currentBlurWarning = "Cell Phone Detected";
-            triggerViolation("Cell Phone Detected");
+        // Run YOLOv8 object detector via backend for cell phone presence
+        try {
+          const screenshot = captureScreenshot();
+          if (screenshot) {
+            const res = await fetch("http://localhost:3000/api/detect-objects", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ screenshot_base64: screenshot })
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (data.status === "success" && data.detected) {
+                const hasPhone = data.detected.some((className: string) => 
+                  className === "cell phone" || className === "phone"
+                );
+                if (hasPhone) {
+                  currentBlurWarning = "Cell Phone Detected";
+                  triggerViolation("Cell Phone Detected");
+                }
+              }
+            }
           }
+        } catch (phoneErr) {
+          console.error("Error detecting cell phone via backend:", phoneErr);
         }
 
         setFaceWarning(currentFaceWarning);
@@ -336,7 +344,7 @@ export default function InterviewScreen() {
     }, 800);
 
     return () => clearInterval(intervalId);
-  }, [modelsLoaded, detector, cocoModel, isInterviewComplete]);
+  }, [modelsLoaded, detector, isInterviewComplete]);
 
   if (isInterviewComplete && reportData) {
     return (

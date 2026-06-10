@@ -1,7 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, Any
+from typing import Dict, Any, List
+import base64
+import io
+from PIL import Image
+from ultralytics import YOLO
 
 import memory_store
 import analyzer
@@ -17,6 +21,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize YOLOv8 model at startup
+print("Loading YOLOv8 model...")
+yolo_model = YOLO("yolov8n.pt")
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
@@ -25,6 +33,9 @@ class LogViolationRequest(BaseModel):
     session_id: str
     type: str
     timestamp: str
+    screenshot_base64: str
+
+class DetectObjectsRequest(BaseModel):
     screenshot_base64: str
 
 @app.get("/")
@@ -52,6 +63,33 @@ def api_log_violation(request: LogViolationRequest):
     )
     return {"status": "success"}
 
+@app.post("/api/detect-objects")
+def api_detect_objects(request: DetectObjectsRequest):
+    """
+    Receive a base64 image and detect objects using YOLOv8.
+    """
+    try:
+        base64_str = request.screenshot_base64
+        if "," in base64_str:
+            base64_str = base64_str.split(",", 1)[1]
+        
+        image_bytes = base64.b64decode(base64_str)
+        image = Image.open(io.BytesIO(image_bytes))
+        
+        results = yolo_model(image, verbose=False)
+        
+        detected = []
+        for r in results:
+            for box in r.boxes:
+                cls_id = int(box.cls[0].item())
+                name = yolo_model.names[cls_id]
+                detected.append(name)
+                
+        return {"status": "success", "detected": detected}
+    except Exception as e:
+        print(f"Error in YOLOv8 detection: {e}")
+        return {"status": "error", "message": str(e), "detected": []}
+
 @app.get("/api/get-report")
 def api_get_report(session_id: str):
     """
@@ -63,3 +101,4 @@ def api_get_report(session_id: str):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=3000)
+
