@@ -1,10 +1,14 @@
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI
+# pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+# pyrefly: ignore [missing-import]
+from pydantic import BaseModel 
 from typing import Dict, Any, List
 import base64
 import io
 from PIL import Image
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 
 import memory_store
@@ -99,6 +103,7 @@ def api_get_report(session_id: str):
     return report
 
 if __name__ == "__main__":
+    # pyrefly: ignore [missing-import]
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=3000)
 

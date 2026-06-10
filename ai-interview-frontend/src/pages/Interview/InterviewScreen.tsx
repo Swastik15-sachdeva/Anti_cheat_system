@@ -186,10 +186,7 @@ export default function InterviewScreen() {
             faceMissingStartRef.current = Date.now();
           }
           const missingSec = (Date.now() - faceMissingStartRef.current) / 1000;
-          if (missingSec >= 4.0) {
-            currentFaceWarning = "Candidate Left Frame";
-            triggerViolation("Candidate Left Frame");
-          } else if (missingSec >= 1.5) {
+          if (missingSec >= 1.5) {
             currentFaceWarning = "Face Missing from Frame";
             triggerViolation("Face Missing from Frame");
           }
@@ -197,23 +194,10 @@ export default function InterviewScreen() {
           // Face found, reset missing start
           faceMissingStartRef.current = null;
 
-          // Multiple faces or person in background checks
+          // Multiple faces check
           if (faces.length >= 2) {
-            const sortedFaces = [...faces].sort((a, b) => {
-              const aArea = (a.box.width || 0) * (a.box.height || 0);
-              const bArea = (b.box.width || 0) * (b.box.height || 0);
-              return bArea - aArea;
-            });
-            const mainFaceArea = (sortedFaces[0].box.width || 1) * (sortedFaces[0].box.height || 1);
-            const secondaryFaceArea = (sortedFaces[1].box.width || 0) * (sortedFaces[1].box.height || 0);
-
-            if (secondaryFaceArea >= 0.45 * mainFaceArea) {
-              currentSecondPersonWarning = "Multiple Faces Detected";
-              triggerViolation("Multiple Faces Detected");
-            } else {
-              currentSecondPersonWarning = "Another Person in Background";
-              triggerViolation("Another Person in Background");
-            }
+            currentSecondPersonWarning = "Multiple Faces Detected";
+            triggerViolation("Multiple Faces Detected");
           }
 
           const mainFace = faces[0];
@@ -222,12 +206,12 @@ export default function InterviewScreen() {
           const videoHeight = video.videoHeight || 480;
 
           // Check if partially hidden or off-screen
-          const margin = 15;
+          const margin = 40;
           const isOffScreen = bbox.xMin < margin || 
                              bbox.yMin < margin || 
                              (bbox.xMax > videoWidth - margin) || 
                              (bbox.yMax > videoHeight - margin);
-          const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.82);
+          const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.90);
 
           if (isOffScreen || isLowConfidence) {
             currentFaceWarning = "Face Partially Hidden";
@@ -254,7 +238,7 @@ export default function InterviewScreen() {
             const d_down = Math.abs(chin.y - nose.y);
             const pitchRatio = d_up / (d_up + d_down || 1);
 
-            if (yawRatio < 0.35 || yawRatio > 0.65 || pitchRatio < 0.38 || pitchRatio > 0.75) {
+            if (yawRatio < 0.40 || yawRatio > 0.60 || pitchRatio < 0.41 || pitchRatio > 0.68) {
               currentGazeWarning = "Looked Away from Screen";
               triggerViolation("Looked Away from Screen");
             }
@@ -287,7 +271,7 @@ export default function InterviewScreen() {
               gazeHistoryRef.current.shift();
             }
 
-            if (avgGaze < 0.32 || avgGaze > 0.68) {
+            if (avgGaze < 0.38 || avgGaze > 0.62) {
               currentGazeWarning = "Eye Shifting / Rapid Eye";
               triggerViolation("Eye Shifting / Rapid Eye Movement");
             } else {
@@ -295,7 +279,7 @@ export default function InterviewScreen() {
               let shiftsCount = 0;
               const history = gazeHistoryRef.current;
               for (let i = 1; i < history.length; i++) {
-                if (Math.abs(history[i] - history[i-1]) > 0.18) {
+                if (Math.abs(history[i] - history[i-1]) > 0.12) {
                   shiftsCount++;
                 }
               }

@@ -24,8 +24,6 @@ const ALL_VIOLATIONS = [
   "Cell Phone Detected",
   "Looked Away from Screen",
   "Eye Shifting / Rapid Eye Movement",
-  "Another Person in Background",
-  "Candidate Left Frame",
   "Face Partially Hidden"
 ];
 
