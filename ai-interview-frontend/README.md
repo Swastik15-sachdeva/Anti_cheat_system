@@ -1,73 +1,40 @@
-# React + TypeScript + Vite
+# AI Interviewer - React Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This directory contains the React + TypeScript + Vite frontend of the **AI Interviewer Proctoring System**.
 
-Currently, two official plugins are available:
+The frontend runs real-time client-side proctoring in the browser using TensorFlow.js and MediaPipe FaceMesh to track candidate behaviors (yaw, pitch, eye-shifting, etc.) with extremely low latency.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+---
 
-## React Compiler
+## Technical Features
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+* **Real-time Camera Stream Integration**: Directly requests webcam permissions and maps the input stream to a canvas for proctoring.
+* **In-Browser Face Mesh Estimation**: Runs `@tensorflow/tfjs` with WebGL acceleration to estimate facial keypoints and tracking boundaries.
+* **Gaze & Pose Analytics**: Evaluates eye shift patterns (REM) and head position thresholds.
+* **Server-Side Verification Sync**: Periodically captures frame screenshots and POSTs them to the backend object detection service for device/materials check.
 
-## Expanding the ESLint configuration
+---
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Installation & Setup
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+1. **Install Dependencies**:
+   ```bash
+   npm install
+   ```
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+2. **Run Development Server**:
+   ```bash
+   npm run dev
+   ```
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+3. **Production Build**:
+   ```bash
+   npm run build
+   ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Configuration & Environment
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+* **API Base URL**: Configured in [InterviewScreen.tsx](file:///c:/Users/sachd/OneDrive/Desktop/internship/Anti-Cheat-System-/ai-interview-frontend/src/pages/Interview/InterviewScreen.tsx) to query the local FastAPI instance running at `http://localhost:3000`.
+* **Proctoring Models Configuration**: Uses `tfjs` backend set to `webgl` for fast matrix computations, falling back to CPU if WebGL is unavailable.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+For details on the proctoring algorithms and backend instructions, please refer to the [Root README](file:///c:/Users/sachd/OneDrive/Desktop/internship/Anti-Cheat-System-/README.md).
