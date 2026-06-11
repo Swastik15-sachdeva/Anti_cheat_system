@@ -25,6 +25,8 @@ export default function InterviewScreen() {
   // Real-time proctoring states
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [detector, setDetector] = useState<any>(null);
+  const [tabSwitchCount, setTabSwitchCount] = useState(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   
   const [faceWarning, setFaceWarning] = useState<string | null>(null);
   const [gazeWarning, setGazeWarning] = useState<string | null>(null);
@@ -330,6 +332,53 @@ export default function InterviewScreen() {
     return () => clearInterval(intervalId);
   }, [modelsLoaded, detector, isInterviewComplete]);
 
+  // 6. Browser event listeners for tab switching and fullscreen
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        setTabSwitchCount(prev => prev + 1);
+        triggerViolation("Tab Switched / Left Window");
+      }
+    };
+
+    const handleBlur = () => {
+      // Only count as window blur if tab is not already hidden (to avoid double count)
+      if (!document.hidden) {
+        setTabSwitchCount(prev => prev + 1);
+        triggerViolation("Tab Switched / Left Window");
+      }
+    };
+
+    const handleFullscreenChange = () => {
+      const isFull = !!document.fullscreenElement;
+      setIsFullscreen(isFull);
+      if (!isFull && !isInterviewComplete) {
+        triggerViolation("Exited Fullscreen");
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", handleBlur);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", handleBlur);
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, [isInterviewComplete]);
+
+  const enterFullscreen = () => {
+    const element = document.documentElement;
+    if (element.requestFullscreen) {
+      element.requestFullscreen().then(() => {
+        setIsFullscreen(true);
+      }).catch(err => {
+        console.error("Error attempting to enable fullscreen:", err);
+      });
+    }
+  };
+
   if (isInterviewComplete && reportData) {
     return (
       <AiInterviewLayout>
@@ -418,12 +467,12 @@ export default function InterviewScreen() {
           messages={MOCK_MESSAGES}
           chatEndRef={chatEndRef}
           isModelLoaded={true}
-          tabSwitchCount={0}
-          isFullscreen={false}
+          tabSwitchCount={tabSwitchCount}
+          isFullscreen={isFullscreen}
           sessionId="mock-session-id"
-          interviewComplete={false}
-          isEnding={false}
-          enterFullscreen={() => {}}
+          interviewComplete={isInterviewComplete}
+          isEnding={isProcessingEnd}
+          enterFullscreen={enterFullscreen}
         />
       </div>
     </AiInterviewLayout>

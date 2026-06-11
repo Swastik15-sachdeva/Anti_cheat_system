@@ -24,7 +24,9 @@ const ALL_VIOLATIONS = [
   "Cell Phone Detected",
   "Looked Away from Screen",
   "Eye Shifting / Rapid Eye Movement",
-  "Face Partially Hidden"
+  "Face Partially Hidden",
+  "Tab Switched / Left Window",
+  "Exited Fullscreen"
 ];
 
 export default function InterviewReport({ reportData, onBack }: Props) {
