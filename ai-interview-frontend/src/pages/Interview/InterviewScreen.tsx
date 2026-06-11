@@ -350,7 +350,12 @@ export default function InterviewScreen() {
     };
 
     const handleFullscreenChange = () => {
-      const isFull = !!document.fullscreenElement;
+      const isFull = !!(
+        document.fullscreenElement ||
+        (document as any).webkitFullscreenElement ||
+        (document as any).mozFullScreenElement ||
+        (document as any).msFullscreenElement
+      );
       setIsFullscreen(isFull);
       if (!isFull && !isInterviewComplete) {
         triggerViolation("Exited Fullscreen");
@@ -360,22 +365,37 @@ export default function InterviewScreen() {
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("blur", handleBlur);
     document.addEventListener("fullscreenchange", handleFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+    document.addEventListener("mozfullscreenchange", handleFullscreenChange);
+    document.addEventListener("MSFullscreenChange", handleFullscreenChange);
 
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("blur", handleBlur);
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+      document.removeEventListener("mozfullscreenchange", handleFullscreenChange);
+      document.removeEventListener("MSFullscreenChange", handleFullscreenChange);
     };
   }, [isInterviewComplete]);
 
   const enterFullscreen = () => {
-    const element = document.documentElement;
+    const element = document.documentElement as any;
     if (element.requestFullscreen) {
       element.requestFullscreen().then(() => {
         setIsFullscreen(true);
-      }).catch(err => {
+      }).catch((err: any) => {
         console.error("Error attempting to enable fullscreen:", err);
       });
+    } else if (element.webkitRequestFullscreen) { /* Safari */
+      element.webkitRequestFullscreen();
+      setIsFullscreen(true);
+    } else if (element.mozRequestFullScreen) { /* Firefox */
+      element.mozRequestFullScreen();
+      setIsFullscreen(true);
+    } else if (element.msRequestFullscreen) { /* IE11 */
+      element.msRequestFullscreen();
+      setIsFullscreen(true);
     }
   };
 

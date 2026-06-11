@@ -226,7 +226,7 @@ export default function TranscriptPanel({
                                 {!isFullscreen && sessionId && !interviewComplete && (
                                     <button
                                         onClick={enterFullscreen}
-                                        className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-md bg-amber-50 border border-amber-200 hover:bg-amber-100 transition-colors shrink-0"
+                                        className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-md bg-amber-50 border border-amber-200 hover:bg-amber-100 transition-colors cursor-pointer shrink-0"
                                     >
                                         <Maximize size={12} className="text-amber-600 shrink-0" />
                                         <span className="text-[9px] sm:text-[10px] font-bold text-amber-700 uppercase tracking-wider whitespace-nowrap">Fullscreen</span>
