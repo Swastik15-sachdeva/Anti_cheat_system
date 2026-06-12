@@ -191,6 +191,7 @@ export default function InterviewScreen() {
   const lastLoggedRef = useRef<{ [key: string]: number }>({});
   const faceMissingStartRef = useRef<number | null>(null);
   const gazeHistoryRef = useRef<number[]>([]);
+  const lastActiveFaceRef = useRef<{ bbox: any; timestamp: number } | null>(null);
 
   const formatTime = (s: number) => {
     const mins = Math.floor(s / 60);
@@ -347,14 +348,21 @@ export default function InterviewScreen() {
         let phoneDetected = false;
         let handOverlapsFace = false;
         let phoneOverlapsFace = false;
+        let personDetected = false;
 
         try {
           const inputTensor = await preprocess(video);
           
-          // 1. Detect Cell Phone (Class ID 67 in COCO dataset)
-          const phoneDetections = await runYOLOInference(yoloSession, inputTensor, 80, 0.25, 0.45, 67);
-          if (phoneDetections.length > 0) {
-            phoneDetected = true;
+          // 1. Detect Person and Phone (Class 0 and 67 in COCO dataset) in one pass
+          const yoloDetections = await runYOLOInference(yoloSession, inputTensor, 80, 0.25, 0.45, null);
+          const phoneDetections = [];
+          for (const det of yoloDetections) {
+            if (det.classId === 0) {
+              personDetected = true;
+            } else if (det.classId === 67) {
+              phoneDetections.push(det);
+              phoneDetected = true;
+            }
           }
 
           // 2. Detect Hands (Class ID 0 in custom hand model)
@@ -408,10 +416,38 @@ export default function InterviewScreen() {
           }
           const missingSec = (Date.now() - faceMissingStartRef.current) / 1000;
           if (missingSec >= 1.5) {
-            currentFaceWarning = "Face Missing from Frame";
-            triggerViolation("Face Missing from Frame");
+            // Check if the face was recently near the edge before disappearing
+            const now = Date.now();
+            let wasPartiallyOffScreen = false;
+            const videoWidth = video.videoWidth || 640;
+            const videoHeight = video.videoHeight || 480;
+            
+            if (lastActiveFaceRef.current && (now - lastActiveFaceRef.current.timestamp < 3000)) {
+              const lastBbox = lastActiveFaceRef.current.bbox;
+              const edgeMargin = 80;
+              wasPartiallyOffScreen = lastBbox.xMin < edgeMargin || 
+                                     lastBbox.yMin < edgeMargin || 
+                                     (lastBbox.xMax > videoWidth - edgeMargin) || 
+                                     (lastBbox.yMax > videoHeight - edgeMargin);
+            }
+
+            // Trigger "Face Partially Hidden" if:
+            // - The face was recently near the edge of the frame
+            // - OR a person is still detected in the frame by YOLO (e.g. only forehead is visible, or face covered)
+            if (wasPartiallyOffScreen || personDetected) {
+              currentFaceWarning = "Face Partially Hidden";
+              triggerViolation("Face Partially Hidden");
+            } else {
+              currentFaceWarning = "Face Missing from Frame";
+              triggerViolation("Face Missing from Frame");
+            }
           }
         } else {
+          // Update last active face
+          lastActiveFaceRef.current = {
+            bbox: faces[0].box,
+            timestamp: Date.now()
+          };
           // Face found, reset missing start
           faceMissingStartRef.current = null;
 
@@ -434,13 +470,62 @@ export default function InterviewScreen() {
                              (bbox.yMax > videoHeight - margin);
           const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.90);
 
-          if (isOffScreen || isLowConfidence || handOverlapsFace || phoneOverlapsFace) {
+          // Advanced face geometry occlusion detection (e.g. hand covering mouth/nose)
+          let isFaceOccluded = false;
+          const keypoints = mainFace.keypoints;
+          if (keypoints && keypoints.length >= 153) {
+            const kp = (idx: number) => keypoints[idx] || { x: 0, y: 0, z: 0 };
+            
+            const nose = kp(4);
+            const leftCheek = kp(234);
+            const rightCheek = kp(454);
+            
+            // Calculate 3D Euclidean distance for face width
+            const faceWidth = Math.sqrt(
+              Math.pow(rightCheek.x - leftCheek.x, 2) + 
+              Math.pow(rightCheek.y - leftCheek.y, 2) + 
+              Math.pow((rightCheek.z ?? 0) - (leftCheek.z ?? 0), 2)
+            ) || 1;
+
+            // Mouth landmarks
+            const mouthLeft = kp(61);
+            const mouthRight = kp(291);
+            const upperLip = kp(0);
+            const lowerLip = kp(17);
+
+            // Mouth width and ratio
+            const mouthWidth = Math.sqrt(
+              Math.pow(mouthRight.x - mouthLeft.x, 2) + 
+              Math.pow(mouthRight.y - mouthLeft.y, 2)
+            );
+            const mouthWidthRatio = mouthWidth / faceWidth;
+
+            // Horizontal mouth symmetry (distance from nose to left/right corners)
+            const d_nose_mouth_left = Math.sqrt(Math.pow(mouthLeft.x - nose.x, 2) + Math.pow(mouthLeft.y - nose.y, 2));
+            const d_nose_mouth_right = Math.sqrt(Math.pow(mouthRight.x - nose.x, 2) + Math.pow(mouthRight.y - nose.y, 2));
+            const mouthSymmetryRatio = Math.max(d_nose_mouth_left, d_nose_mouth_right) / (Math.min(d_nose_mouth_left, d_nose_mouth_right) || 1);
+
+            // Z-depth ratio (mouth depth behind nose tip, normalized by face width)
+            // Normally, mouth is significantly behind the nose tip (positive diff in MediaPipe coordinate space).
+            // If covered by hand/object, the mouth landmarks map forward onto the hand/object, reducing this depth gap.
+            const avgMouthZ = ((upperLip.z ?? 0) + (lowerLip.z ?? 0)) / 2;
+            const mouthZDepthRatio = (avgMouthZ - (nose.z ?? 0)) / faceWidth;
+
+            // Occlusion triggers:
+            // 1. Mouth width ratio collapses (mouth landmarks compressed horizontally)
+            // 2. Mouth symmetry ratio is highly skewed (half of mouth covered/distorted)
+            // 3. Mouth Z-depth ratio is compressed (mouth pushed unnaturally forward, i.e., < 0.04 of face width)
+            if (mouthWidthRatio < 0.16 || mouthSymmetryRatio > 1.8 || mouthZDepthRatio < 0.04) {
+              isFaceOccluded = true;
+            }
+          }
+
+          if (isOffScreen || isLowConfidence || handOverlapsFace || phoneOverlapsFace || isFaceOccluded) {
             currentFaceWarning = "Face Partially Hidden";
             triggerViolation("Face Partially Hidden");
           }
 
           // Gaze and Head Pose checks
-          const keypoints = mainFace.keypoints;
           if (keypoints && keypoints.length >= 153) {
             const kp = (idx: number) => keypoints[idx] || { x: 0, y: 0, z: 0 };
             

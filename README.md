@@ -11,7 +11,7 @@ An intelligent AI Interviewer platform equipped with a real-time, low-latency cl
 * **Multiple People Detection**: Alerts when multiple faces or another person in the background is detected.
 * **Looked Away from Screen**: Calculates head yaw and pitch angles to detect when the candidate looks away.
 * **Eye Shifting / REM Detection**: Tracks pupils to alert on rapid eye movements or shifting gaze.
-* **Face Partially Hidden**: Detects if the face is obscured or partially off-screen.
+* **Face Partially Hidden**: Detects if the face is obscured (using advanced mouth symmetry, width collapse, and 3D Z-depth compression checking) or if the face is partially off-screen (using boundary drift history and YOLOv8 person-detection fallback).
 
 ### 🧠 Server-Side Proctoring (API)
 * **Cell Phone Detection**: Periodically analyzes webcam screenshots using YOLOv8 (`yolov8n.pt`) to detect smartphones, tablets, or books.
@@ -89,3 +89,20 @@ Anti-Cheat-System/
 2. **Real-time Assessment**: Bounding box size, coordinates, relative landmark ratios, and pupil locations are calculated dynamically inside the browser.
 3. **Throttled Violation Calls**: When a violation condition is met, the screenshot is captured, compressed, and posted to the backend `/api/log-violation` endpoint. These events are throttled to a maximum of once every 10 seconds per type to save bandwidth.
 4. **Final Reporting**: Clicking "End Interview" fetches the generated report from `/api/get-report` and presents it visually to the user, displaying each flagged event with its screenshot and timestamp.
+
+---
+
+## Advanced Detection Algorithms
+
+To increase accuracy and reduce false positives/negatives, the proctoring engine implements several advanced geometric filters:
+
+### 🎭 1. Occlusion Detection (Hand-over-Mouth/Face)
+Even if FaceMesh maintains high overall confidence (`>0.90`) when a candidate covers their face, the system checks:
+* **3D Z-Depth Compression**: Measures the Z-depth gap between the nose tip and the lips. When a hand covers the mouth, the landmarks project forward onto the hand, compressing the nose-to-lip depth gap to near zero.
+* **Mouth Width Collapse**: Triggers if the horizontal lip width shrinks below 16% of the overall face width.
+* **Horizontal Asymmetry**: Measures the skew ratio between the nose and the left/right mouth corners.
+
+### 🖼️ 2. Boundary Drift & YOLO Fallback
+When a candidate moves partially off-screen (e.g. only forehead or half face is visible), the FaceMesh detector completely fails (`faces.length === 0`). The system resolves this using:
+* **Boundary Memory**: If the face disappears within 3 seconds of being near any of the four frame boundaries (within 80px), it is flagged as **Face Partially Hidden** instead of **Face Missing**.
+* **YOLOv8 Person Detection Fallback**: The client-side YOLOv8 model runs a single-pass inference on the webcam stream. If FaceMesh fails but YOLOv8 still detects a **"Person" (Class ID 0)** in the frame (indicating only part of the head or body is visible), it is flagged as **Face Partially Hidden**. If no person is detected at all, it is classified as **Face Missing from Frame**.
