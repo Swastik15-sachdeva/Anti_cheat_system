@@ -193,6 +193,12 @@ export default function InterviewScreen() {
   const gazeHistoryRef = useRef<number[]>([]);
   const lastActiveFaceRef = useRef<{ bbox: any; timestamp: number } | null>(null);
 
+  // Baselines for head pose self-calibration
+  const baselineYawRef = useRef<number | null>(null);
+  const baselinePitchRef = useRef<number | null>(null);
+  const baselineYaw3DRef = useRef<number | null>(null);
+  const baselinePitch3DRef = useRef<number | null>(null);
+
   const formatTime = (s: number) => {
     const mins = Math.floor(s / 60);
     const secs = s % 60;
@@ -537,6 +543,10 @@ export default function InterviewScreen() {
             const d_right = Math.abs(rightCheek.x - nose.x);
             const yawRatio = d_left / (d_left + d_right || 1);
 
+            // 3D Yaw Depth Difference
+            const faceWidth = Math.abs(rightCheek.x - leftCheek.x) || 1;
+            const yaw3D = (leftCheek.z - rightCheek.z) / faceWidth;
+
             // Pitch (looking up/down)
             const forehead = kp(10);
             const chin = kp(152);
@@ -544,15 +554,40 @@ export default function InterviewScreen() {
             const d_down = Math.abs(chin.y - nose.y);
             const pitchRatio = d_up / (d_up + d_down || 1);
 
-            if (yawRatio < 0.40 || yawRatio > 0.60 || pitchRatio < 0.41 || pitchRatio > 0.68) {
+            // 3D Pitch Depth Difference
+            const faceHeight = Math.abs(chin.y - forehead.y) || 1;
+            const pitch3D = (forehead.z - chin.z) / faceHeight;
+
+            // Self-Calibration of Baselines
+            if (baselineYawRef.current === null) baselineYawRef.current = yawRatio;
+            if (baselinePitchRef.current === null) baselinePitchRef.current = pitchRatio;
+            if (baselineYaw3DRef.current === null) baselineYaw3DRef.current = yaw3D;
+            if (baselinePitch3DRef.current === null) baselinePitch3DRef.current = pitch3D;
+
+            // Compute Deviations from Baselines
+            const yawDev = Math.abs(yawRatio - baselineYawRef.current);
+            const pitchDev = Math.abs(pitchRatio - baselinePitchRef.current);
+            const yaw3DDev = Math.abs(yaw3D - baselineYaw3DRef.current);
+            const pitch3DDev = Math.abs(pitch3D - baselinePitch3DRef.current);
+
+            // Looked away triggers:
+            // Yaw deviation > 0.06 OR Pitch deviation > 0.07 OR 3D Yaw deviation > 0.16 OR 3D Pitch deviation > 0.16
+            const isLookingAway = yawDev > 0.06 || pitchDev > 0.07 || yaw3DDev > 0.16 || pitch3DDev > 0.16;
+
+            if (isLookingAway) {
               currentGazeWarning = "Looked Away from Screen";
               triggerViolation("Looked Away from Screen");
             }
 
             // Eye Shifting / Pupil tracking
-            let iris_left = keypoints[468];
-            let iris_right = keypoints[473];
-            if (!iris_left || !iris_right) {
+            let iris_left = keypoints.find((k: any) => k.name === "leftIris" || k.name === "leftEyeIris");
+            let iris_right = keypoints.find((k: any) => k.name === "rightIris" || k.name === "rightEyeIris");
+            if (!iris_left) iris_left = keypoints[468];
+            if (!iris_right) iris_right = keypoints[473];
+
+            const isIrisFallbackActive = !iris_left || !iris_right;
+
+            if (isIrisFallbackActive) {
               const top_left = kp(159);
               const bottom_left = kp(145);
               const top_right = kp(386);
@@ -577,23 +612,36 @@ export default function InterviewScreen() {
               gazeHistoryRef.current.shift();
             }
 
-            if (avgGaze < 0.38 || avgGaze > 0.62) {
-              currentGazeWarning = "Eye Shifting / Rapid Eye";
-              triggerViolation("Eye Shifting / Rapid Eye Movement");
-            } else {
+            // Gaze check (only if we have real iris keypoints, since the fallback is a static eyelid center and does not move)
+            if (!isIrisFallbackActive) {
+              const isEyeShifting = avgGaze < 0.44 || avgGaze > 0.56;
+              
               // Check rapid transitions (REM)
               let shiftsCount = 0;
               const history = gazeHistoryRef.current;
               for (let i = 1; i < history.length; i++) {
-                if (Math.abs(history[i] - history[i-1]) > 0.12) {
+                if (Math.abs(history[i] - history[i-1]) >= 0.04) {
                   shiftsCount++;
                 }
               }
-              if (shiftsCount >= 3) {
+              const isREM = shiftsCount >= 3;
+
+              if (isEyeShifting || isREM) {
                 currentGazeWarning = "Eye Shifting / Rapid Eye";
                 triggerViolation("Eye Shifting / Rapid Eye Movement");
               }
             }
+
+            // Real-time debug logging for calibration verification
+            console.log(
+              `[Proctoring Debug] ` +
+              `Yaw Ratio: ${yawRatio.toFixed(3)} (Dev: ${yawDev.toFixed(3)}), ` +
+              `Pitch Ratio: ${pitchRatio.toFixed(3)} (Dev: ${pitchDev.toFixed(3)}), ` +
+              `Yaw 3D: ${yaw3D.toFixed(3)} (Dev: ${yaw3DDev.toFixed(3)}), ` +
+              `Pitch 3D: ${pitch3D.toFixed(3)} (Dev: ${pitch3DDev.toFixed(3)}), ` +
+              `Avg Gaze: ${avgGaze.toFixed(3)}, ` +
+              `Iris Mode: ${isIrisFallbackActive ? "Fallback (Eyelid Center)" : "Active Iris"}`
+            );
           }
         }
 
