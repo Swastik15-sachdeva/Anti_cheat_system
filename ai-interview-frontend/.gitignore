@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# ONNX Runtime WASM files (loaded from CDN)
+public/ort-wasm-simd-threaded*

@@ -1,5 +1,6 @@
 import urllib.request
 import os
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 
 # Resolve paths relative to backend directory

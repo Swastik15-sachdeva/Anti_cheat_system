@@ -8,8 +8,8 @@ import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detec
 import "@tensorflow/tfjs-backend-webgl";
 import * as ort from "onnxruntime-web";
 
-// Configure WASM paths for onnxruntime-web
-ort.env.wasm.wasmPaths = "/";
+// Configure WASM paths for onnxruntime-web to load from CDN (avoids Vite transformation issues in development)
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/";
 
 interface Detection {
   box: [number, number, number, number]; // [y_min, x_min, y_max, x_max]
