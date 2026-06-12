@@ -6,6 +6,155 @@ import type { InterviewReportData } from "./ui/InterviewReport";
 import * as tf from "@tensorflow/tfjs";
 import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
 import "@tensorflow/tfjs-backend-webgl";
+import * as ort from "onnxruntime-web";
+
+// Configure WASM paths for onnxruntime-web
+ort.env.wasm.wasmPaths = "/";
+
+interface Detection {
+  box: [number, number, number, number]; // [y_min, x_min, y_max, x_max]
+  score: number;
+  classId: number;
+}
+
+// Draw video frame to a 640x640 canvas and return a Float32Array ONNX Tensor in CHW format
+async function preprocess(video: HTMLVideoElement): Promise<ort.Tensor> {
+  const size = 640;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not get 2D context");
+
+  ctx.drawImage(video, 0, 0, size, size);
+  const imgData = ctx.getImageData(0, 0, size, size);
+  const data = imgData.data;
+
+  const numPixels = size * size;
+  const inputBuffer = new Float32Array(3 * numPixels);
+
+  // Normalize pixel values to [0, 1] and transpose from HWC to CHW
+  for (let i = 0; i < numPixels; i++) {
+    inputBuffer[i] = data[i * 4] / 255.0;                   // R
+    inputBuffer[numPixels + i] = data[i * 4 + 1] / 255.0;   // G
+    inputBuffer[2 * numPixels + i] = data[i * 4 + 2] / 255.0; // B
+  }
+
+  return new ort.Tensor("float32", inputBuffer, [1, 3, 640, 640]);
+}
+
+// Decodes raw YOLOv8 ONNX outputs [1, 4 + numClasses, 8400] using TensorFlow.js
+function decodeYOLOv8(
+  outputTensor: ort.Tensor,
+  numClasses: number,
+  targetClassId: number | null = null
+): { tfBoxes: tf.Tensor2D; scores: tf.Tensor1D; classIds: tf.Tensor1D } {
+  return tf.tidy(() => {
+    const rawData = outputTensor.data as Float32Array;
+    const rawOutput = tf.tensor3d(rawData, [1, 4 + numClasses, 8400]);
+
+    // Transpose from [1, 4+numClasses, 8400] to [8400, 4+numClasses]
+    const reshaped = rawOutput.squeeze([0]).transpose([1, 0]) as tf.Tensor2D;
+
+    // Split box coordinates and class scores
+    const boxes = reshaped.slice([0, 0], [8400, 4]); // [x_center, y_center, w, h]
+    const classesScores = reshaped.slice([0, 4], [8400, numClasses]);
+
+    let maxScores: tf.Tensor1D;
+    let classIds: tf.Tensor1D;
+
+    if (numClasses === 1) {
+      maxScores = classesScores.squeeze([1]) as tf.Tensor1D;
+      classIds = tf.zeros([8400]) as tf.Tensor1D;
+    } else {
+      maxScores = classesScores.max(1) as tf.Tensor1D;
+      classIds = classesScores.argMax(1) as tf.Tensor1D;
+    }
+
+    // Convert coordinates from [x_center, y_center, w, h] to [y_min, x_min, y_max, x_max]
+    const [x_center, y_center, w, h] = tf.split(boxes, 4, 1);
+    const halfW = tf.div(w, 2);
+    const halfH = tf.div(h, 2);
+    const x_min = tf.sub(x_center, halfW);
+    const y_min = tf.sub(y_center, halfH);
+    const x_max = tf.add(x_center, halfW);
+    const y_max = tf.add(y_center, halfH);
+    const tfBoxes = tf.concat([y_min, x_min, y_max, x_max], 1) as tf.Tensor2D;
+
+    let scores = maxScores;
+    if (targetClassId !== null) {
+      const classMask = tf.equal(classIds, tf.scalar(targetClassId, "int32"));
+      scores = tf.where(classMask, maxScores, tf.zerosLike(maxScores)) as tf.Tensor1D;
+    }
+
+    return {
+      tfBoxes: tfBoxes.clone(),
+      scores: scores.clone(),
+      classIds: classIds.clone()
+    };
+  });
+}
+
+// Runs inference, decodes, and applies NMS using TensorFlow.js GPU
+async function runYOLOInference(
+  session: any,
+  inputTensor: ort.Tensor,
+  numClasses: number,
+  scoreThreshold: number = 0.25,
+  iouThreshold: number = 0.45,
+  targetClassId: number | null = null
+): Promise<Detection[]> {
+  const outputs = await session.run({ images: inputTensor });
+  const outputName = session.outputNames[0];
+  const outputTensor = outputs[outputName];
+
+  const { tfBoxes, scores, classIds } = decodeYOLOv8(outputTensor, numClasses, targetClassId);
+
+  const nmsIndices = await tf.image.nonMaxSuppressionAsync(
+    tfBoxes,
+    scores,
+    20, // max detections
+    iouThreshold,
+    scoreThreshold
+  );
+
+  const selectedBoxes = tfBoxes.gather(nmsIndices);
+  const selectedScores = scores.gather(nmsIndices);
+  const selectedClasses = classIds.gather(nmsIndices);
+
+  const boxesArray = (await selectedBoxes.array()) as number[][];
+  const scoresArray = (await selectedScores.array()) as number[];
+  const classesArray = (await selectedClasses.array()) as number[];
+
+  // Clean up tensors to avoid WebGL memory leaks
+  tfBoxes.dispose();
+  scores.dispose();
+  classIds.dispose();
+  nmsIndices.dispose();
+  selectedBoxes.dispose();
+  selectedScores.dispose();
+  selectedClasses.dispose();
+
+  const detections: Detection[] = [];
+  for (let i = 0; i < boxesArray.length; i++) {
+    detections.push({
+      box: boxesArray[i] as [number, number, number, number],
+      score: scoresArray[i],
+      classId: classesArray[i]
+    });
+  }
+
+  return detections;
+}
+
+// Checks if bounding box A overlaps with bounding box B
+function checkOverlap(boxA: [number, number, number, number], boxB: [number, number, number, number]): boolean {
+  const [yMinA, xMinA, yMaxA, xMaxA] = boxA;
+  const [yMinB, xMinB, yMaxB, xMaxB] = boxB;
+
+  return !(xMinA > xMaxB || xMaxA < xMinB || yMinA > yMaxB || yMaxA < yMinB);
+}
+
 
 const MOCK_MESSAGES = [
   { role: "system", text: "Interview started", timestamp: new Date() },
@@ -25,6 +174,8 @@ export default function InterviewScreen() {
   // Real-time proctoring states
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [detector, setDetector] = useState<any>(null);
+  const [yoloSession, setYoloSession] = useState<any>(null);
+  const [handSession, setHandSession] = useState<any>(null);
   const [tabSwitchCount, setTabSwitchCount] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   
@@ -63,8 +214,18 @@ export default function InterviewScreen() {
           refineLandmarks: true
         });
 
+        console.log("Loading YOLO ONNX models in browser...");
+        const ySession = await ort.InferenceSession.create("/models/yolov8n.onnx", {
+          executionProviders: ["wasm"]
+        });
+        const hSession = await ort.InferenceSession.create("/models/hand_yolov8n.onnx", {
+          executionProviders: ["wasm"]
+        });
+
         if (active) {
           setDetector(faceDetector);
+          setYoloSession(ySession);
+          setHandSession(hSession);
           setModelsLoaded(true);
           console.log("Proctoring models loaded successfully.");
         }
@@ -164,7 +325,7 @@ export default function InterviewScreen() {
 
   // 5. Main Proctoring Detection Loop
   useEffect(() => {
-    if (!modelsLoaded || !detector || isInterviewComplete) {
+    if (!modelsLoaded || !detector || isInterviewComplete || !yoloSession || !handSession) {
       return;
     }
 
@@ -182,6 +343,64 @@ export default function InterviewScreen() {
 
         // Run face landmark detector
         const faces = await detector.estimateFaces(video, { flipHorizontal: false });
+
+        let phoneDetected = false;
+        let handOverlapsFace = false;
+        let phoneOverlapsFace = false;
+
+        try {
+          const inputTensor = await preprocess(video);
+          
+          // 1. Detect Cell Phone (Class ID 67 in COCO dataset)
+          const phoneDetections = await runYOLOInference(yoloSession, inputTensor, 80, 0.25, 0.45, 67);
+          if (phoneDetections.length > 0) {
+            phoneDetected = true;
+          }
+
+          // 2. Detect Hands (Class ID 0 in custom hand model)
+          const handDetections = await runYOLOInference(handSession, inputTensor, 1, 0.25, 0.45, 0);
+
+          // 3. Check Overlap if face is found
+          if (faces && faces.length > 0) {
+            const mainFace = faces[0];
+            const keypoints = mainFace.keypoints;
+            const videoWidth = video.videoWidth || 640;
+            const videoHeight = video.videoHeight || 480;
+
+            let face_x_min = Infinity;
+            let face_y_min = Infinity;
+            let face_x_max = -Infinity;
+            let face_y_max = -Infinity;
+
+            for (const kp of keypoints) {
+              const scaledX = kp.x * (640 / videoWidth);
+              const scaledY = kp.y * (640 / videoHeight);
+              if (scaledX < face_x_min) face_x_min = scaledX;
+              if (scaledY < face_y_min) face_y_min = scaledY;
+              if (scaledX > face_x_max) face_x_max = scaledX;
+              if (scaledY > face_y_max) face_y_max = scaledY;
+            }
+            const faceBox: [number, number, number, number] = [face_y_min, face_x_min, face_y_max, face_x_max];
+
+            // Check if hand overlaps with the face
+            for (const det of handDetections) {
+              if (checkOverlap(det.box, faceBox)) {
+                handOverlapsFace = true;
+                break;
+              }
+            }
+
+            // Check if phone overlaps with the face
+            for (const det of phoneDetections) {
+              if (checkOverlap(det.box, faceBox)) {
+                phoneOverlapsFace = true;
+                break;
+              }
+            }
+          }
+        } catch (mlErr) {
+          console.error("Error in browser edge ML inference:", mlErr);
+        }
 
         if (!faces || faces.length === 0) {
           if (faceMissingStartRef.current === null) {
@@ -207,7 +426,7 @@ export default function InterviewScreen() {
           const videoWidth = video.videoWidth || 640;
           const videoHeight = video.videoHeight || 480;
 
-          // Check if partially hidden or off-screen
+          // Check if partially hidden, off-screen, or covered by hand/phone
           const margin = 40;
           const isOffScreen = bbox.xMin < margin || 
                              bbox.yMin < margin || 
@@ -215,7 +434,7 @@ export default function InterviewScreen() {
                              (bbox.yMax > videoHeight - margin);
           const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.90);
 
-          if (isOffScreen || isLowConfidence) {
+          if (isOffScreen || isLowConfidence || handOverlapsFace || phoneOverlapsFace) {
             currentFaceWarning = "Face Partially Hidden";
             triggerViolation("Face Partially Hidden");
           }
@@ -293,30 +512,10 @@ export default function InterviewScreen() {
           }
         }
 
-        // Run YOLOv8 object detector via backend for cell phone presence
-        try {
-          const screenshot = captureScreenshot();
-          if (screenshot) {
-            const res = await fetch("http://localhost:3000/api/detect-objects", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ screenshot_base64: screenshot })
-            });
-            if (res.ok) {
-              const data = await res.json();
-              if (data.status === "success" && data.detected) {
-                const hasPhone = data.detected.some((className: string) => 
-                  className === "cell phone" || className === "phone"
-                );
-                if (hasPhone) {
-                  currentBlurWarning = "Cell Phone Detected";
-                  triggerViolation("Cell Phone Detected");
-                }
-              }
-            }
-          }
-        } catch (phoneErr) {
-          console.error("Error detecting cell phone via backend:", phoneErr);
+        // Handle cell phone violation warnings locally
+        if (phoneDetected) {
+          currentBlurWarning = "Cell Phone Detected";
+          triggerViolation("Cell Phone Detected");
         }
 
         setFaceWarning(currentFaceWarning);
@@ -330,7 +529,7 @@ export default function InterviewScreen() {
     }, 800);
 
     return () => clearInterval(intervalId);
-  }, [modelsLoaded, detector, isInterviewComplete]);
+  }, [modelsLoaded, detector, yoloSession, handSession, isInterviewComplete]);
 
   // 6. Browser event listeners for tab switching and fullscreen
   useEffect(() => {
