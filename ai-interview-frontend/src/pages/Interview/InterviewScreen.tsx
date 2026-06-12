@@ -452,7 +452,7 @@ export default function InterviewScreen() {
           faceMissingStartRef.current = null;
 
           // Multiple faces check
-          if (faces.length >= 2) {
+          if (faces.length > 1) {
             currentSecondPersonWarning = "Multiple Faces Detected";
             triggerViolation("Multiple Faces Detected");
           }
