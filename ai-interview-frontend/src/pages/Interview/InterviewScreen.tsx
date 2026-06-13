@@ -8,8 +8,8 @@ import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detec
 import "@tensorflow/tfjs-backend-webgl";
 import * as ort from "onnxruntime-web";
 
-// Configure WASM paths for onnxruntime-web to load from CDN (avoids Vite transformation issues in development)
-ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/";
+// Configure WASM paths for onnxruntime-web to load locally
+ort.env.wasm.wasmPaths = "/wasm/";
 
 interface Detection {
   box: [number, number, number, number]; // [y_min, x_min, y_max, x_max]
@@ -301,8 +301,7 @@ export default function InterviewScreen() {
         console.log("Loading Face Mesh detector...");
         const faceMeshModel = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
         const faceDetector = await faceLandmarksDetection.createDetector(faceMeshModel, {
-          runtime: "mediapipe",
-          solutionPath: "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh",
+          runtime: "tfjs",
           refineLandmarks: true
         });
 
