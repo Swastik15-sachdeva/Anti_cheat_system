@@ -481,12 +481,10 @@ export default function InterviewScreen() {
               if (scaledX > face_x_max) face_x_max = scaledX;
               if (scaledY > face_y_max) face_y_max = scaledY;
             }
-            // Normalize to [0, 1] space to match YOLO box coordinates which are
-            // also in [0, 1] (YOLO outputs are in 0–640 pixel space, divided by 640).
-            const faceBox: [number, number, number, number] = [
-              face_y_min / 640, face_x_min / 640,
-              face_y_max / 640, face_x_max / 640
-            ];
+            // Face box is in 0–640 pixel space (keypoints were scaled to match the
+            // 640×640 YOLO input). YOLO detection boxes are also in 0–640 pixel space
+            // (model outputs in input-image coordinates). Both spaces match — no normalization needed.
+            const faceBox: [number, number, number, number] = [face_y_min, face_x_min, face_y_max, face_x_max];
 
             // Check if hand overlaps with the face
             for (const det of handDetections) {
@@ -651,18 +649,33 @@ export default function InterviewScreen() {
             // Z depth calculations (independent of pixel coordinate scaling)
             const pitch3D = forehead.z - chin.z;
 
-            // Self-Calibration
-            if (baselineYawRef.current === null) baselineYawRef.current = yawRatio;
+            // Initial calibration on first frame
+            if (baselineYawRef.current === null)   baselineYawRef.current   = yawRatio;
             if (baselinePitchRef.current === null) baselinePitchRef.current = pitchRatio;
             if (baselineYaw3DRef.current === null) baselineYaw3DRef.current = yaw3D;
             if (baselinePitch3DRef.current === null) baselinePitch3DRef.current = pitch3D;
 
-            const yawDev = Math.abs(yawRatio - baselineYawRef.current);
-            const pitchDev = Math.abs(pitchRatio - baselinePitchRef.current);
-            const yaw3DDev = Math.abs(yaw3D - baselineYaw3DRef.current);
-            const pitch3DDev = Math.abs(pitch3D - baselinePitch3DRef.current);
+            const yawDev    = Math.abs(yawRatio   - baselineYawRef.current);
+            const pitchDev  = Math.abs(pitchRatio - baselinePitchRef.current);
+            const yaw3DDev  = Math.abs(yaw3D      - baselineYaw3DRef.current);
+            const pitch3DDev = Math.abs(pitch3D   - baselinePitch3DRef.current);
 
-            isLookingAway = yawDev > 0.06 || pitchDev > 0.07 || yaw3DDev > 0.16 || pitch3DDev > 0.16;
+            // Threshold calibrated for a typical close-up webcam interview:
+            // 0.09 yaw  = ~20° lateral head turn (enough to clearly look away)
+            // 0.08 pitch = ~15° up/down (nodding is ≈0.03–0.05, so safe margin)
+            // 0.18 3D    = reliable Z-depth threshold for side/up-down glances
+            isLookingAway = yawDev > 0.09 || pitchDev > 0.08 || yaw3DDev > 0.18 || pitch3DDev > 0.18;
+
+            // Exponential Moving Average baseline update (α=0.015 ≈ adapts over ~65 frames)
+            // Only updates when the head is NOT looking away, so the baseline can never
+            // "chase" a sustained violation (e.g., looking at a phone for 30 seconds).
+            if (!isLookingAway) {
+              const α = 0.015;
+              baselineYawRef.current    = (1 - α) * baselineYawRef.current   + α * yawRatio;
+              baselinePitchRef.current  = (1 - α) * baselinePitchRef.current + α * pitchRatio;
+              baselineYaw3DRef.current  = (1 - α) * baselineYaw3DRef.current + α * yaw3D;
+              baselinePitch3DRef.current = (1 - α) * baselinePitch3DRef.current + α * pitch3D;
+            }
           }
           updateProctorState("Looked Away from Screen", isLookingAway, 3000);
 
