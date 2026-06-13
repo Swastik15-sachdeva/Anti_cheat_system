@@ -455,11 +455,8 @@ input[type=number] {
   display: list-item !important;
 }
 
-.toast-info-border {
-  border-left: 4px solid #0ea5e9;
-  background: #f0f9ff;
-  color: #0369a1;
-}
+/* Violation toast: red styling — see bottom of file for .toast-info-border */
+
 
 /* Job Description HTML preview (ReviewSubmit) — mirrors .rsw-ce editor output */
 .ql-editor-preview {

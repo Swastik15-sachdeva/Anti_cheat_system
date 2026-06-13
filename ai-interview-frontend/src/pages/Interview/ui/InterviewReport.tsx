@@ -48,6 +48,29 @@ export default function InterviewReport({ reportData, onBack }: Props) {
           </button>
         </div>
 
+        {/* Score Card + Feedback */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm flex flex-col items-center justify-center gap-2">
+            <span className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Overall Score</span>
+            <span
+              className={`text-5xl font-extrabold ${
+                reportData.overallScore >= 80
+                  ? "text-green-600"
+                  : reportData.overallScore >= 60
+                  ? "text-amber-500"
+                  : "text-red-600"
+              }`}
+            >
+              {reportData.overallScore}
+            </span>
+            <span className="text-xs text-gray-400">out of 100</span>
+          </div>
+          <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm">
+            <span className="text-sm font-semibold text-gray-500 uppercase tracking-wider block mb-2">Feedback</span>
+            <p className="text-sm text-gray-700 leading-relaxed">{reportData.feedback}</p>
+          </div>
+        </div>
+
         {/* Violations Summary List */}
         <div className="bg-white p-6 rounded-xl border border-gray-200 shadow-sm">
           <div className="flex items-center gap-2 mb-6">

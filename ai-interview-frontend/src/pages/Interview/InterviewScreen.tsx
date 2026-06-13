@@ -186,7 +186,7 @@ function checkSignificantOverlap(
 
 
 const MOCK_MESSAGES = [
-  { role: "system", text: "Interview started", timestamp: new Date() },
+  { role: "system", text: "Interview started", timestamp: new Date(Date.now() - 5000) },
   { role: "ai", text: "Hello! Welcome to your interview for the Frontend Engineer position. Are you ready to begin?", timestamp: new Date() }
 ];
 
@@ -195,7 +195,7 @@ export default function InterviewScreen() {
   const [isAiSpeaking] = useState(false);
   const [isUserSpeaking] = useState(false);
   const [isVideoOn] = useState(true);
-  const [timeLeft] = useState(300); // 5 minutes
+  const [timeLeft, setTimeLeft] = useState(300); // 5 minutes
   const [isInterviewComplete, setIsInterviewComplete] = useState(false);
   const [reportData, setReportData] = useState<InterviewReportData | null>(null);
   const [isProcessingEnd, setIsProcessingEnd] = useState(false);
@@ -262,6 +262,7 @@ export default function InterviewScreen() {
         const suspectTime = suspectStartRef.current[type] || now;
         if (now - suspectTime >= durationMs) {
           stateRef.current[type] = "CONFIRMED";
+          triggerViolation(type); // Fire immediately on first CONFIRMED transition
         }
       } else if (currentState === "CONFIRMED" || currentState === "LOGGED") {
         // Cooldown throttling check (10 seconds)
@@ -278,7 +279,7 @@ export default function InterviewScreen() {
       }
     } else {
       stateRef.current[type] = "IDLE";
-      suspectStartRef.current[type] = 0;
+      suspectStartRef.current[type] = 0; // Reset to 0 (falsy, treated as "not started")
     }
   };
 
@@ -287,6 +288,21 @@ export default function InterviewScreen() {
     const secs = s % 60;
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
+
+  // 0. Countdown timer — decrements every second, stops when interview ends
+  useEffect(() => {
+    if (isInterviewComplete) return;
+    const timerId = setInterval(() => {
+      setTimeLeft(prev => {
+        if (prev <= 1) {
+          clearInterval(timerId);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerId);
+  }, [isInterviewComplete]);
 
   // 1. Initialize TFJS and load Models
   useEffect(() => {
