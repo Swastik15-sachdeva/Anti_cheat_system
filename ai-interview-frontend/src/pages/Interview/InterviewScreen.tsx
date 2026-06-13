@@ -58,7 +58,10 @@ function decodeYOLOv8(
 
     // Split box coordinates and class scores
     const boxes = reshaped.slice([0, 0], [8400, 4]); // [x_center, y_center, w, h]
-    const classesScores = reshaped.slice([0, 4], [8400, numClasses]);
+    // Apply sigmoid activation to output logits to compute true confidence scores
+    const classesScores = tf.sigmoid(
+      reshaped.slice([0, 4], [8400, numClasses])
+    ) as tf.Tensor2D;
 
     let maxScores: tf.Tensor1D;
     let classIds: tf.Tensor1D;
@@ -155,6 +158,32 @@ function checkOverlap(boxA: [number, number, number, number], boxB: [number, num
   return !(xMinA > xMaxB || xMaxA < xMinB || yMinA > yMaxB || yMaxA < yMinB);
 }
 
+// Checks if bounding box A overlaps significantly with bounding box B
+function checkSignificantOverlap(
+  boxA: [number, number, number, number],
+  boxB: [number, number, number, number],
+  minRatio = 0.15
+): boolean {
+  const [yMinA, xMinA, yMaxA, xMaxA] = boxA;
+  const [yMinB, xMinB, yMaxB, xMaxB] = boxB;
+
+  const yMinIntersect = Math.max(yMinA, yMinB);
+  const xMinIntersect = Math.max(xMinA, xMinB);
+  const yMaxIntersect = Math.min(yMaxA, yMaxB);
+  const xMaxIntersect = Math.min(xMaxA, xMaxB);
+
+  if (yMinIntersect >= yMaxIntersect || xMinIntersect >= xMaxIntersect) {
+    return false;
+  }
+
+  const intersectArea = (yMaxIntersect - yMinIntersect) * (xMaxIntersect - xMinIntersect);
+  const areaA = (yMaxA - yMinA) * (xMaxA - xMinA) || 1;
+  const areaB = (yMaxB - yMinB) * (xMaxB - xMinB) || 1;
+
+  // Overlap is significant if intersection area is at least minRatio of either box
+  return (intersectArea / areaA > minRatio) || (intersectArea / areaB > minRatio);
+}
+
 
 const MOCK_MESSAGES = [
   { role: "system", text: "Interview started", timestamp: new Date() },
@@ -199,6 +228,61 @@ export default function InterviewScreen() {
   const baselineYaw3DRef = useRef<number | null>(null);
   const baselinePitch3DRef = useRef<number | null>(null);
 
+  // Proctoring State Machine and Buffers (IDLE -> SUSPECTED -> CONFIRMED -> LOGGED)
+  const stateRef = useRef<{ [key: string]: "IDLE" | "SUSPECTED" | "CONFIRMED" | "LOGGED" }>({});
+  const suspectStartRef = useRef<{ [key: string]: number }>({});
+  const bufferRef = useRef<{ [key: string]: boolean[] }>({});
+
+  const updateProctorState = (type: string, isCurrentlyViolating: boolean, durationMs: number) => {
+    if (!bufferRef.current[type]) {
+      bufferRef.current[type] = [];
+    }
+    if (!stateRef.current[type]) {
+      stateRef.current[type] = "IDLE";
+    }
+
+    const history = bufferRef.current[type];
+    history.push(isCurrentlyViolating);
+    if (history.length > 5) {
+      history.shift();
+    }
+
+    // Majority voting: At least 4 of the last 5 frames must indicate a violation
+    const trueCount = history.filter(v => v).length;
+    const filteredViolating = history.length >= 4 ? trueCount >= 4 : isCurrentlyViolating;
+
+    const currentState = stateRef.current[type];
+    const now = Date.now();
+
+    if (filteredViolating) {
+      if (currentState === "IDLE") {
+        stateRef.current[type] = "SUSPECTED";
+        suspectStartRef.current[type] = now;
+      } else if (currentState === "SUSPECTED") {
+        const suspectTime = suspectStartRef.current[type] || now;
+        if (now - suspectTime >= durationMs) {
+          stateRef.current[type] = "CONFIRMED";
+        }
+      } else if (currentState === "CONFIRMED") {
+        // Cooldown throttling check (10 seconds)
+        const lastLog = lastLoggedRef.current[type] || 0;
+        const isCoolingDown = now - lastLog < 10000;
+        
+        if (!isCoolingDown) {
+          stateRef.current[type] = "LOGGED";
+          triggerViolation(type);
+        } else {
+          // Stay in SUSPECTED state if on cooldown
+          stateRef.current[type] = "SUSPECTED";
+          suspectStartRef.current[type] = now;
+        }
+      }
+    } else {
+      stateRef.current[type] = "IDLE";
+      suspectStartRef.current[type] = 0;
+    }
+  };
+
   const formatTime = (s: number) => {
     const mins = Math.floor(s / 60);
     const secs = s % 60;
@@ -217,7 +301,8 @@ export default function InterviewScreen() {
         console.log("Loading Face Mesh detector...");
         const faceMeshModel = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
         const faceDetector = await faceLandmarksDetection.createDetector(faceMeshModel, {
-          runtime: "tfjs",
+          runtime: "mediapipe",
+          solutionPath: "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh",
           refineLandmarks: true
         });
 
@@ -337,42 +422,41 @@ export default function InterviewScreen() {
     }
 
     const intervalId = setInterval(async () => {
+      // Avoid running tracking and logging false missing violations when the tab is not focused
+      if (document.hidden) {
+        return;
+      }
+
       const video = videoRef.current;
       if (!video || video.readyState !== 4 || video.paused || video.ended) {
         return;
       }
 
       try {
-        let currentFaceWarning: string | null = null;
-        let currentGazeWarning: string | null = null;
-        let currentSecondPersonWarning: string | null = null;
-        let currentBlurWarning: string | null = null;
-
         // Run face landmark detector
         const faces = await detector.estimateFaces(video, { flipHorizontal: false });
 
         let phoneDetected = false;
         let handOverlapsFace = false;
         let phoneOverlapsFace = false;
-        let personDetected = false;
+
+        let handDetections: Detection[] = [];
+        let phoneDetections: Detection[] = [];
 
         try {
           const inputTensor = await preprocess(video);
           
           // 1. Detect Person and Phone (Class 0 and 67 in COCO dataset) in one pass
+          // The YOLO scores are now sigmoid-scaled, representing proper probabilities.
           const yoloDetections = await runYOLOInference(yoloSession, inputTensor, 80, 0.25, 0.45, null);
-          const phoneDetections = [];
           for (const det of yoloDetections) {
-            if (det.classId === 0) {
-              personDetected = true;
-            } else if (det.classId === 67) {
+            if (det.classId === 67 && det.score > 0.60) {
               phoneDetections.push(det);
-              phoneDetected = true;
             }
           }
 
           // 2. Detect Hands (Class ID 0 in custom hand model)
-          const handDetections = await runYOLOInference(handSession, inputTensor, 1, 0.25, 0.45, 0);
+          handDetections = await runYOLOInference(handSession, inputTensor, 1, 0.25, 0.45, 0);
 
           // 3. Check Overlap if face is found
           if (faces && faces.length > 0) {
@@ -404,10 +488,11 @@ export default function InterviewScreen() {
               }
             }
 
-            // Check if phone overlaps with the face
+            // Check if phone overlaps significantly with the face (confidence > 0.60, area overlap >= 15%)
             for (const det of phoneDetections) {
-              if (checkOverlap(det.box, faceBox)) {
+              if (checkSignificantOverlap(det.box, faceBox, 0.15)) {
                 phoneOverlapsFace = true;
+                phoneDetected = true;
                 break;
               }
             }
@@ -416,67 +501,67 @@ export default function InterviewScreen() {
           console.error("Error in browser edge ML inference:", mlErr);
         }
 
+        // Determine face state checks
         if (!faces || faces.length === 0) {
           if (faceMissingStartRef.current === null) {
             faceMissingStartRef.current = Date.now();
           }
-          const missingSec = (Date.now() - faceMissingStartRef.current) / 1000;
-          if (missingSec >= 1.5) {
-            // Check if the face was recently near the edge before disappearing
-            const now = Date.now();
-            let wasPartiallyOffScreen = false;
-            const videoWidth = video.videoWidth || 640;
-            const videoHeight = video.videoHeight || 480;
-            
-            if (lastActiveFaceRef.current && (now - lastActiveFaceRef.current.timestamp < 3000)) {
-              const lastBbox = lastActiveFaceRef.current.bbox;
-              const edgeMargin = 80;
-              wasPartiallyOffScreen = lastBbox.xMin < edgeMargin || 
-                                     lastBbox.yMin < edgeMargin || 
-                                     (lastBbox.xMax > videoWidth - edgeMargin) || 
-                                     (lastBbox.yMax > videoHeight - edgeMargin);
-            }
 
-            // Trigger "Face Partially Hidden" if:
-            // - The face was recently near the edge of the frame
-            // - OR a person is still detected in the frame by YOLO (e.g. only forehead is visible, or face covered)
-            if (wasPartiallyOffScreen || personDetected) {
-              currentFaceWarning = "Face Partially Hidden";
-              triggerViolation("Face Partially Hidden");
-            } else {
-              currentFaceWarning = "Face Missing from Frame";
-              triggerViolation("Face Missing from Frame");
-            }
+          // Check boundary memory if face disappeared
+          const now = Date.now();
+          let wasPartiallyOffScreen = false;
+          const videoWidth = video.videoWidth || 640;
+          const videoHeight = video.videoHeight || 480;
+          
+          if (lastActiveFaceRef.current && (now - lastActiveFaceRef.current.timestamp < 3000)) {
+            const lastBbox = lastActiveFaceRef.current.bbox;
+            const edgeMargin = 80;
+            wasPartiallyOffScreen = lastBbox.xMin < edgeMargin || 
+                                   lastBbox.yMin < edgeMargin || 
+                                   (lastBbox.xMax > videoWidth - edgeMargin) || 
+                                   (lastBbox.yMax > videoHeight - edgeMargin);
           }
+
+          const hasHandInFrame = handDetections.length > 0;
+          const hasPhoneInFrame = phoneDetections.length > 0;
+
+          // Replace personDetected alone with actual occlusion indicators
+          const isPartiallyHiddenRaw = wasPartiallyOffScreen || hasHandInFrame || hasPhoneInFrame;
+          const isFaceMissingRaw = !isPartiallyHiddenRaw;
+
+          updateProctorState("Face Partially Hidden", isPartiallyHiddenRaw, 2000);
+          updateProctorState("Face Missing from Frame", isFaceMissingRaw, 2000);
+          updateProctorState("Multiple Faces Detected", false, 1000);
+          updateProctorState("Cell Phone Detected", false, 1500);
+          updateProctorState("Looked Away from Screen", false, 3000);
+          updateProctorState("Eye Shifting / Rapid Eye Movement", false, 2000);
         } else {
           // Update last active face
           lastActiveFaceRef.current = {
             bbox: faces[0].box,
             timestamp: Date.now()
           };
-          // Face found, reset missing start
           faceMissingStartRef.current = null;
 
-          // Multiple faces check
-          if (faces.length > 1) {
-            currentSecondPersonWarning = "Multiple Faces Detected";
-            triggerViolation("Multiple Faces Detected");
-          }
+          // 1. Multiple faces check (1.0 second persistence)
+          const isMultipleFacesRaw = faces.length > 1;
+          updateProctorState("Multiple Faces Detected", isMultipleFacesRaw, 1000);
 
           const mainFace = faces[0];
           const bbox = mainFace.box;
           const videoWidth = video.videoWidth || 640;
           const videoHeight = video.videoHeight || 480;
 
-          // Check if partially hidden, off-screen, or covered by hand/phone
+          // Check partially hidden indicators
           const margin = 40;
           const isOffScreen = bbox.xMin < margin || 
                              bbox.yMin < margin || 
                              (bbox.xMax > videoWidth - margin) || 
                              (bbox.yMax > videoHeight - margin);
-          const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.90);
+          // Relaxed confidence threshold from 0.90 to 0.65
+          const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.65);
 
-          // Advanced face geometry occlusion detection (e.g. hand covering mouth/nose)
+          // Advanced face geometry occlusion check (natural expressions, speaking, smiling should be ignored)
           let isFaceOccluded = false;
           const keypoints = mainFace.keypoints;
           if (keypoints && keypoints.length >= 153) {
@@ -486,52 +571,52 @@ export default function InterviewScreen() {
             const leftCheek = kp(234);
             const rightCheek = kp(454);
             
-            // Calculate 3D Euclidean distance for face width
-            const faceWidth = Math.sqrt(
-              Math.pow(rightCheek.x - leftCheek.x, 2) + 
-              Math.pow(rightCheek.y - leftCheek.y, 2) + 
-              Math.pow((rightCheek.z ?? 0) - (leftCheek.z ?? 0), 2)
-            ) || 1;
+            // Scaled using unscaled Z-depth values (ratio space) to avoid coordinate scaling mismatch
+            const avgMouthZ = ((kp(0).z ?? 0) + (kp(17).z ?? 0)) / 2;
+            const mouthZDepthRatio = avgMouthZ - (nose.z ?? 0);
 
-            // Mouth landmarks
             const mouthLeft = kp(61);
             const mouthRight = kp(291);
-            const upperLip = kp(0);
-            const lowerLip = kp(17);
 
-            // Mouth width and ratio
+            // Compute ratios using proper baseline width in pixel space
             const mouthWidth = Math.sqrt(
               Math.pow(mouthRight.x - mouthLeft.x, 2) + 
               Math.pow(mouthRight.y - mouthLeft.y, 2)
             );
-            const mouthWidthRatio = mouthWidth / faceWidth;
+            const pxFaceWidth = Math.sqrt(
+              Math.pow(rightCheek.x - leftCheek.x, 2) + 
+              Math.pow(rightCheek.y - leftCheek.y, 2)
+            ) || 1;
+            const mouthWidthRatio = mouthWidth / pxFaceWidth;
 
-            // Horizontal mouth symmetry (distance from nose to left/right corners)
             const d_nose_mouth_left = Math.sqrt(Math.pow(mouthLeft.x - nose.x, 2) + Math.pow(mouthLeft.y - nose.y, 2));
             const d_nose_mouth_right = Math.sqrt(Math.pow(mouthRight.x - nose.x, 2) + Math.pow(mouthRight.y - nose.y, 2));
+            // Increased symmetry ratio to 2.0 to ignore speaking asymmetry and natural head tilts
             const mouthSymmetryRatio = Math.max(d_nose_mouth_left, d_nose_mouth_right) / (Math.min(d_nose_mouth_left, d_nose_mouth_right) || 1);
 
-            // Z-depth ratio (mouth depth behind nose tip, normalized by face width)
-            // Normally, mouth is significantly behind the nose tip (positive diff in MediaPipe coordinate space).
-            // If covered by hand/object, the mouth landmarks map forward onto the hand/object, reducing this depth gap.
-            const avgMouthZ = ((upperLip.z ?? 0) + (lowerLip.z ?? 0)) / 2;
-            const mouthZDepthRatio = (avgMouthZ - (nose.z ?? 0)) / faceWidth;
-
-            // Occlusion triggers:
-            // 1. Mouth width ratio collapses (mouth landmarks compressed horizontally)
-            // 2. Mouth symmetry ratio is highly skewed (half of mouth covered/distorted)
-            // 3. Mouth Z-depth ratio is compressed (mouth pushed unnaturally forward, i.e., < 0.04 of face width)
-            if (mouthWidthRatio < 0.16 || mouthSymmetryRatio > 1.8 || mouthZDepthRatio < 0.04) {
+            // Occulusion triggers: mouth width collapse, high asymmetry, or Z-depth compression
+            if (mouthWidthRatio < 0.16 || mouthSymmetryRatio > 2.0 || mouthZDepthRatio < 0.04) {
               isFaceOccluded = true;
             }
           }
 
-          if (isOffScreen || isLowConfidence || handOverlapsFace || phoneOverlapsFace || isFaceOccluded) {
-            currentFaceWarning = "Face Partially Hidden";
-            triggerViolation("Face Partially Hidden");
-          }
+          // Weighted scoring system: Trigger only if score >= 2
+          let partiallyHiddenScore = 0;
+          if (phoneOverlapsFace) partiallyHiddenScore += 2.0;
+          if (handOverlapsFace) partiallyHiddenScore += 1.5;
+          if (isOffScreen) partiallyHiddenScore += 1.0;
+          if (isLowConfidence) partiallyHiddenScore += 1.0;
+          if (isFaceOccluded) partiallyHiddenScore += 1.0;
 
-          // Gaze and Head Pose checks
+          const isPartiallyHiddenRaw = partiallyHiddenScore >= 2.0;
+          updateProctorState("Face Partially Hidden", isPartiallyHiddenRaw, 2000);
+          updateProctorState("Face Missing from Frame", false, 2000);
+
+          // 2. Cell Phone checks (confidence > 0.60, area overlap >= 15%, 1.5 second persistence)
+          updateProctorState("Cell Phone Detected", phoneDetected, 1500);
+
+          // 3. Gaze and Head Pose checks (3.0 seconds persistence)
+          let isLookingAway = false;
           if (keypoints && keypoints.length >= 153) {
             const kp = (idx: number) => keypoints[idx] || { x: 0, y: 0, z: 0 };
             
@@ -543,9 +628,8 @@ export default function InterviewScreen() {
             const d_right = Math.abs(rightCheek.x - nose.x);
             const yawRatio = d_left / (d_left + d_right || 1);
 
-            // 3D Yaw Depth Difference
-            const faceWidth = Math.abs(rightCheek.x - leftCheek.x) || 1;
-            const yaw3D = (leftCheek.z - rightCheek.z) / faceWidth;
+            // Z depth calculations (independent of pixel coordinate scaling)
+            const yaw3D = leftCheek.z - rightCheek.z;
 
             // Pitch (looking up/down)
             const forehead = kp(10);
@@ -554,32 +638,28 @@ export default function InterviewScreen() {
             const d_down = Math.abs(chin.y - nose.y);
             const pitchRatio = d_up / (d_up + d_down || 1);
 
-            // 3D Pitch Depth Difference
-            const faceHeight = Math.abs(chin.y - forehead.y) || 1;
-            const pitch3D = (forehead.z - chin.z) / faceHeight;
+            // Z depth calculations (independent of pixel coordinate scaling)
+            const pitch3D = forehead.z - chin.z;
 
-            // Self-Calibration of Baselines
+            // Self-Calibration
             if (baselineYawRef.current === null) baselineYawRef.current = yawRatio;
             if (baselinePitchRef.current === null) baselinePitchRef.current = pitchRatio;
             if (baselineYaw3DRef.current === null) baselineYaw3DRef.current = yaw3D;
             if (baselinePitch3DRef.current === null) baselinePitch3DRef.current = pitch3D;
 
-            // Compute Deviations from Baselines
             const yawDev = Math.abs(yawRatio - baselineYawRef.current);
             const pitchDev = Math.abs(pitchRatio - baselinePitchRef.current);
             const yaw3DDev = Math.abs(yaw3D - baselineYaw3DRef.current);
             const pitch3DDev = Math.abs(pitch3D - baselinePitch3DRef.current);
 
-            // Looked away triggers:
-            // Yaw deviation > 0.06 OR Pitch deviation > 0.07 OR 3D Yaw deviation > 0.16 OR 3D Pitch deviation > 0.16
-            const isLookingAway = yawDev > 0.06 || pitchDev > 0.07 || yaw3DDev > 0.16 || pitch3DDev > 0.16;
+            isLookingAway = yawDev > 0.06 || pitchDev > 0.07 || yaw3DDev > 0.16 || pitch3DDev > 0.16;
+          }
+          updateProctorState("Looked Away from Screen", isLookingAway, 3000);
 
-            if (isLookingAway) {
-              currentGazeWarning = "Looked Away from Screen";
-              triggerViolation("Looked Away from Screen");
-            }
-
-            // Eye Shifting / Pupil tracking
+          // 4. Eye Shifting / Pupil tracking (2.0 seconds persistence)
+          let isEyeShiftingRaw = false;
+          if (keypoints && keypoints.length >= 153) {
+            const kp = (idx: number) => keypoints[idx] || { x: 0, y: 0, z: 0 };
             let iris_left = keypoints.find((k: any) => k.name === "leftIris" || k.name === "leftEyeIris");
             let iris_right = keypoints.find((k: any) => k.name === "rightIris" || k.name === "rightEyeIris");
             if (!iris_left) iris_left = keypoints[468];
@@ -612,11 +692,8 @@ export default function InterviewScreen() {
               gazeHistoryRef.current.shift();
             }
 
-            // Gaze check (only if we have real iris keypoints, since the fallback is a static eyelid center and does not move)
             if (!isIrisFallbackActive) {
               const isEyeShifting = avgGaze < 0.44 || avgGaze > 0.56;
-              
-              // Check rapid transitions (REM)
               let shiftsCount = 0;
               const history = gazeHistoryRef.current;
               for (let i = 1; i < history.length; i++) {
@@ -625,31 +702,24 @@ export default function InterviewScreen() {
                 }
               }
               const isREM = shiftsCount >= 3;
-
-              if (isEyeShifting || isREM) {
-                currentGazeWarning = "Eye Shifting / Rapid Eye";
-                triggerViolation("Eye Shifting / Rapid Eye Movement");
-              }
+              isEyeShiftingRaw = isEyeShifting || isREM;
             }
-
-            // Real-time debug logging for calibration verification
-            console.log(
-              `[Proctoring Debug] ` +
-              `Yaw Ratio: ${yawRatio.toFixed(3)} (Dev: ${yawDev.toFixed(3)}), ` +
-              `Pitch Ratio: ${pitchRatio.toFixed(3)} (Dev: ${pitchDev.toFixed(3)}), ` +
-              `Yaw 3D: ${yaw3D.toFixed(3)} (Dev: ${yaw3DDev.toFixed(3)}), ` +
-              `Pitch 3D: ${pitch3D.toFixed(3)} (Dev: ${pitch3DDev.toFixed(3)}), ` +
-              `Avg Gaze: ${avgGaze.toFixed(3)}, ` +
-              `Iris Mode: ${isIrisFallbackActive ? "Fallback (Eyelid Center)" : "Active Iris"}`
-            );
           }
+          updateProctorState("Eye Shifting / Rapid Eye Movement", isEyeShiftingRaw, 2000);
         }
 
-        // Handle cell phone violation warnings locally
-        if (phoneDetected) {
-          currentBlurWarning = "Cell Phone Detected";
-          triggerViolation("Cell Phone Detected");
-        }
+        // Map state machine warning levels to warning triggers
+        const getWarningText = (type: string, activeText: string): string | null => {
+          const s = stateRef.current[type];
+          return (s === "SUSPECTED" || s === "CONFIRMED" || s === "LOGGED") ? activeText : null;
+        };
+
+        const currentFaceWarning = getWarningText("Face Missing from Frame", "Face Missing from Frame") || 
+                                   getWarningText("Face Partially Hidden", "Face Partially Hidden");
+        const currentGazeWarning = getWarningText("Looked Away from Screen", "Looked Away from Screen") || 
+                                   getWarningText("Eye Shifting / Rapid Eye Movement", "Eye Shifting / Rapid Eye Movement");
+        const currentSecondPersonWarning = getWarningText("Multiple Faces Detected", "Multiple Faces Detected");
+        const currentBlurWarning = getWarningText("Cell Phone Detected", "Cell Phone Detected");
 
         setFaceWarning(currentFaceWarning);
         setGazeWarning(currentGazeWarning);
