@@ -521,11 +521,11 @@ export default function InterviewScreen() {
                                    (lastBbox.yMax > videoHeight - edgeMargin);
           }
 
-          const hasHandInFrame = handDetections.length > 0;
-          const hasPhoneInFrame = phoneDetections.length > 0;
-
-          // Replace personDetected alone with actual occlusion indicators
-          const isPartiallyHiddenRaw = wasPartiallyOffScreen || hasHandInFrame || hasPhoneInFrame;
+          // When no face is detected, only classify as "Partially Hidden" if the face
+          // was seen recently near the video edge (suggesting it slid off-screen).
+          // Hand/phone detections alone are NOT reliable here — the YOLO model can
+          // mis-detect fabric, lamps, or other objects when there is no face present.
+          const isPartiallyHiddenRaw = wasPartiallyOffScreen;
           const isFaceMissingRaw = !isPartiallyHiddenRaw;
 
           updateProctorState("Face Partially Hidden", isPartiallyHiddenRaw, 2000);
@@ -551,14 +551,16 @@ export default function InterviewScreen() {
           const videoWidth = video.videoWidth || 640;
           const videoHeight = video.videoHeight || 480;
 
-          // Check partially hidden indicators
-          const margin = 40;
+          // Check partially hidden indicators — use a tight margin so a face that is
+          // merely large or close to the camera edge doesn't false-positive.
+          const margin = 20;
           const isOffScreen = bbox.xMin < margin || 
                              bbox.yMin < margin || 
                              (bbox.xMax > videoWidth - margin) || 
                              (bbox.yMax > videoHeight - margin);
-          // Relaxed confidence threshold from 0.90 to 0.65
-          const isLowConfidence = (mainFace.score !== undefined && mainFace.score < 0.65);
+          // NOTE: MediaPipe confidence scores fluctuate with lighting and viewing angle
+          // and are NOT a reliable indicator that the face is occluded, so we no longer
+          // include them in the partially-hidden score.
 
           // Advanced face geometry occlusion check (natural expressions, speaking, smiling should be ignored)
           let isFaceOccluded = false;
@@ -593,21 +595,24 @@ export default function InterviewScreen() {
             // Increased symmetry ratio to 2.0 to ignore speaking asymmetry and natural head tilts
             const mouthSymmetryRatio = Math.max(d_nose_mouth_left, d_nose_mouth_right) / (Math.min(d_nose_mouth_left, d_nose_mouth_right) || 1);
 
-            // Occulusion triggers: mouth width collapse, high asymmetry, or Z-depth compression
-            if (mouthWidthRatio < 0.16 || mouthSymmetryRatio > 2.0 || mouthZDepthRatio < 0.04) {
+            // Occlusion triggers: mouth width collapse or extreme asymmetry only.
+            // Z-depth ratio is excluded — MediaPipe's relative Z near nose/mouth is too
+            // noisy and nearly zero for a forward-facing face, causing false positives.
+            if (mouthWidthRatio < 0.14 || mouthSymmetryRatio > 2.5) {
               isFaceOccluded = true;
             }
           }
 
-          // Weighted scoring system: Trigger only if score >= 2
+          // Weighted scoring system.
+          // Threshold is STRICTLY > 2.0 so two weak signals (off-screen + occluded)
+          // alone cannot trigger it — a phone or hand overlap is required.
           let partiallyHiddenScore = 0;
           if (phoneOverlapsFace) partiallyHiddenScore += 2.0;
           if (handOverlapsFace) partiallyHiddenScore += 1.5;
-          if (isOffScreen) partiallyHiddenScore += 1.0;
-          if (isLowConfidence) partiallyHiddenScore += 1.0;
-          if (isFaceOccluded) partiallyHiddenScore += 1.0;
+          if (isOffScreen)      partiallyHiddenScore += 0.5; // reduced weight
+          if (isFaceOccluded)   partiallyHiddenScore += 0.5; // reduced weight
 
-          const isPartiallyHiddenRaw = partiallyHiddenScore >= 2.0;
+          const isPartiallyHiddenRaw = partiallyHiddenScore > 2.0;
           updateProctorState("Face Partially Hidden", isPartiallyHiddenRaw, 2000);
           updateProctorState("Face Missing from Frame", false, 2000);
 
@@ -710,7 +715,10 @@ export default function InterviewScreen() {
         // Map state machine warning levels to warning triggers
         const getWarningText = (type: string, activeText: string): string | null => {
           const s = stateRef.current[type];
-          return (s === "SUSPECTED" || s === "CONFIRMED" || s === "LOGGED") ? activeText : null;
+          // Only surface a warning once the violation has been CONFIRMED (held for the
+          // full persistence window), not on the first SUSPECTED frame.  This prevents
+          // brief or spurious detections from flashing a banner on screen.
+          return (s === "CONFIRMED" || s === "LOGGED") ? activeText : null;
         };
 
         const currentFaceWarning = getWarningText("Face Missing from Frame", "Face Missing from Frame") || 
