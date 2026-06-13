@@ -8,8 +8,8 @@ import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detec
 import "@tensorflow/tfjs-backend-webgl";
 import * as ort from "onnxruntime-web";
 
-// Configure WASM paths for onnxruntime-web to load locally
-ort.env.wasm.wasmPaths = "/wasm/";
+// Configure WASM paths for onnxruntime-web to load from the backend to bypass Vite dynamic import issues
+ort.env.wasm.wasmPaths = "http://localhost:3000/static/wasm/";
 
 interface Detection {
   box: [number, number, number, number]; // [y_min, x_min, y_max, x_max]
@@ -306,10 +306,10 @@ export default function InterviewScreen() {
         });
 
         console.log("Loading YOLO ONNX models in browser...");
-        const ySession = await ort.InferenceSession.create("/models/yolov8n.onnx", {
+        const ySession = await ort.InferenceSession.create("http://localhost:3000/static/models/yolov8n.onnx", {
           executionProviders: ["wasm"]
         });
-        const hSession = await ort.InferenceSession.create("/models/hand_yolov8n.onnx", {
+        const hSession = await ort.InferenceSession.create("http://localhost:3000/static/models/hand_yolov8n.onnx", {
           executionProviders: ["wasm"]
         });
 

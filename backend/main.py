@@ -1,8 +1,7 @@
 # pyrefly: ignore [missing-import]
 from fastapi import FastAPI
-# pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
-# pyrefly: ignore [missing-import]
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel 
 from typing import Dict, Any, List
 import base64
@@ -21,6 +20,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static folder to serve WASM files and ONNX models
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class ChatRequest(BaseModel):
     session_id: str
