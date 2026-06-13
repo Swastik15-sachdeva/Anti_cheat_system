@@ -263,19 +263,18 @@ export default function InterviewScreen() {
         if (now - suspectTime >= durationMs) {
           stateRef.current[type] = "CONFIRMED";
         }
-      } else if (currentState === "CONFIRMED") {
+      } else if (currentState === "CONFIRMED" || currentState === "LOGGED") {
         // Cooldown throttling check (10 seconds)
         const lastLog = lastLoggedRef.current[type] || 0;
         const isCoolingDown = now - lastLog < 10000;
-        
+
         if (!isCoolingDown) {
+          // Re-log the violation now that cooldown has passed
           stateRef.current[type] = "LOGGED";
           triggerViolation(type);
-        } else {
-          // Stay in SUSPECTED state if on cooldown
-          stateRef.current[type] = "SUSPECTED";
-          suspectStartRef.current[type] = now;
         }
+        // While cooling down, stay in LOGGED so the UI banner remains visible
+        // and we re-try every frame until the cooldown expires.
       }
     } else {
       stateRef.current[type] = "IDLE";
@@ -444,18 +443,23 @@ export default function InterviewScreen() {
 
         try {
           const inputTensor = await preprocess(video);
-          
-          // 1. Detect Person and Phone (Class 0 and 67 in COCO dataset) in one pass
-          // The YOLO scores are now sigmoid-scaled, representing proper probabilities.
-          const yoloDetections = await runYOLOInference(yoloSession, inputTensor, 80, 0.25, 0.45, null);
-          for (const det of yoloDetections) {
-            if (det.classId === 67 && det.score > 0.60) {
-              phoneDetections.push(det);
-            }
-          }
 
-          // 2. Detect Hands (Class ID 0 in custom hand model)
-          handDetections = await runYOLOInference(handSession, inputTensor, 1, 0.25, 0.45, 0);
+          try {
+            // 1. Detect Person and Phone (Class 0 and 67 in COCO dataset) in one pass
+            // The YOLO scores are now sigmoid-scaled, representing proper probabilities.
+            const yoloDetections = await runYOLOInference(yoloSession, inputTensor, 80, 0.25, 0.45, null);
+            for (const det of yoloDetections) {
+              if (det.classId === 67 && det.score > 0.60) {
+                phoneDetections.push(det);
+              }
+            }
+
+            // 2. Detect Hands (Class ID 0 in custom hand model)
+            handDetections = await runYOLOInference(handSession, inputTensor, 1, 0.25, 0.45, 0);
+          } finally {
+            // Always dispose the ONNX tensor to prevent GPU/WASM memory leaks
+            inputTensor.dispose();
+          }
 
           // 3. Check Overlap if face is found
           if (faces && faces.length > 0) {
@@ -477,7 +481,12 @@ export default function InterviewScreen() {
               if (scaledX > face_x_max) face_x_max = scaledX;
               if (scaledY > face_y_max) face_y_max = scaledY;
             }
-            const faceBox: [number, number, number, number] = [face_y_min, face_x_min, face_y_max, face_x_max];
+            // Normalize to [0, 1] space to match YOLO box coordinates which are
+            // also in [0, 1] (YOLO outputs are in 0–640 pixel space, divided by 640).
+            const faceBox: [number, number, number, number] = [
+              face_y_min / 640, face_x_min / 640,
+              face_y_max / 640, face_x_max / 640
+            ];
 
             // Check if hand overlaps with the face
             for (const det of handDetections) {
@@ -499,6 +508,7 @@ export default function InterviewScreen() {
         } catch (mlErr) {
           console.error("Error in browser edge ML inference:", mlErr);
         }
+        // Note: inputTensor is disposed inside the inner try/finally above.
 
         // Determine face state checks
         if (!faces || faces.length === 0) {
@@ -572,10 +582,6 @@ export default function InterviewScreen() {
             const leftCheek = kp(234);
             const rightCheek = kp(454);
             
-            // Scaled using unscaled Z-depth values (ratio space) to avoid coordinate scaling mismatch
-            const avgMouthZ = ((kp(0).z ?? 0) + (kp(17).z ?? 0)) / 2;
-            const mouthZDepthRatio = avgMouthZ - (nose.z ?? 0);
-
             const mouthLeft = kp(61);
             const mouthRight = kp(291);
 
@@ -607,10 +613,10 @@ export default function InterviewScreen() {
           // Threshold is STRICTLY > 2.0 so two weak signals (off-screen + occluded)
           // alone cannot trigger it — a phone or hand overlap is required.
           let partiallyHiddenScore = 0;
-          if (phoneOverlapsFace) partiallyHiddenScore += 2.0;
-          if (handOverlapsFace) partiallyHiddenScore += 1.5;
-          if (isOffScreen)      partiallyHiddenScore += 0.5; // reduced weight
-          if (isFaceOccluded)   partiallyHiddenScore += 0.5; // reduced weight
+          if (phoneOverlapsFace) partiallyHiddenScore += 2.5; // phone over face is definitive
+          if (handOverlapsFace)  partiallyHiddenScore += 2.1; // hand over face alone is sufficient
+          if (isOffScreen)       partiallyHiddenScore += 0.5;
+          if (isFaceOccluded)    partiallyHiddenScore += 0.5;
 
           const isPartiallyHiddenRaw = partiallyHiddenScore > 2.0;
           updateProctorState("Face Partially Hidden", isPartiallyHiddenRaw, 2000);
@@ -697,11 +703,14 @@ export default function InterviewScreen() {
             }
 
             if (!isIrisFallbackActive) {
-              const isEyeShifting = avgGaze < 0.44 || avgGaze > 0.56;
+              // ±10% band around center (0.5). Tighter bands cause false positives
+              // when the candidate reads a question or scans their screen.
+              const isEyeShifting = avgGaze < 0.40 || avgGaze > 0.60;
               let shiftsCount = 0;
               const history = gazeHistoryRef.current;
               for (let i = 1; i < history.length; i++) {
-                if (Math.abs(history[i] - history[i-1]) >= 0.04) {
+                // Require a larger per-frame jump to count as rapid eye movement
+                if (Math.abs(history[i] - history[i-1]) >= 0.08) {
                   shiftsCount++;
                 }
               }
@@ -751,9 +760,9 @@ export default function InterviewScreen() {
     };
 
     const handleBlur = () => {
-      // Only count as window blur if tab is not already hidden (to avoid double count)
+      // Log the violation but do NOT increment tabSwitchCount here — visibilitychange
+      // also fires on alt-tab and would double-count it. Only visibilitychange counts.
       if (!document.hidden) {
-        setTabSwitchCount(prev => prev + 1);
         triggerViolation("Tab Switched / Left Window");
       }
     };
