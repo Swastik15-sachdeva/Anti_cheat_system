@@ -6,6 +6,12 @@ import type { InterviewReportData } from "./ui/InterviewReport";
 import * as tf from "@tensorflow/tfjs";
 import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
 import "@tensorflow/tfjs-backend-webgl";
+import * as faceMesh from "@mediapipe/face_mesh";
+
+if (typeof window !== "undefined") {
+  // Extract FaceMesh from namespace or default export, fallback to module itself
+  (window as any).FaceMesh = (faceMesh as any).FaceMesh || (faceMesh as any).default || faceMesh;
+}
 
 const MOCK_MESSAGES = [
   { role: "system", text: "Interview started", timestamp: new Date() },
@@ -55,6 +61,7 @@ export default function InterviewScreen() {
   
   const lastLoggedRef = useRef<{ [key: string]: number }>({});
   const faceMissingStartRef = useRef<number | null>(null);
+  const lastFaceBoxRef = useRef<{ box: any; timestamp: number } | null>(null);
   const gazeHistoryRef = useRef<number[]>([]);
   const detectionInProgressRef = useRef(false);
   const remTrackingRef = useRef<{ shifts: number; lastValue: number | null }>({ shifts: 0, lastValue: null });
@@ -101,7 +108,8 @@ export default function InterviewScreen() {
         console.log("Loading Face Mesh detector...");
         const faceMeshModel = faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh;
         const faceDetector = await faceLandmarksDetection.createDetector(faceMeshModel, {
-          runtime: "tfjs",
+          runtime: "mediapipe",
+          solutionPath: "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh",
           refineLandmarks: true
         });
 
@@ -233,21 +241,74 @@ export default function InterviewScreen() {
         let currentBlurWarning: string | null = null;
 
         const screenshot = captureScreenshot();
-        const faces = await detector.estimateFaces(video, { flipHorizontal: false });
+        
+        // Run FaceMesh and YOLOv8 in parallel to prevent blocking the interval
+        const [faces, yoloRes] = await Promise.all([
+          detector.estimateFaces(video, { flipHorizontal: false }),
+          screenshot 
+            ? fetch("http://localhost:3000/api/detect-objects", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ screenshot_base64: screenshot })
+              }).then(res => res.ok ? res.json() : null).catch(() => null)
+            : Promise.resolve(null)
+        ]);
 
         debug("Face Detection", { facesDetected: faces?.length || 0 });
 
+        const detectedObjects: string[] = yoloRes && yoloRes.status === "success" ? yoloRes.detected || [] : [];
+        if (yoloRes) {
+          debug("Object Detection", { detected: detectedObjects });
+        }
+
+        const hasPhone = detectedObjects.some((className: string) => 
+          className.toLowerCase().includes("cell phone") || 
+          className.toLowerCase().includes("phone") ||
+          className.toLowerCase().includes("book")
+        );
+        const hasPerson = detectedObjects.some((className: string) => 
+          className.toLowerCase() === "person"
+        );
+
+        if (hasPhone) {
+          currentBlurWarning = "Cell Phone Detected";
+          triggerViolation("Cell Phone Detected", screenshot);
+        }
+
+        const videoWidth = video.videoWidth || 640;
+        const videoHeight = video.videoHeight || 480;
+
+        // Apply Boundary Memory Check
+        const boundaryThreshold = 80;
+        let wasNearBoundary = false;
+        if (lastFaceBoxRef.current && (Date.now() - lastFaceBoxRef.current.timestamp < 3000)) {
+          const lastBox = lastFaceBoxRef.current.box;
+          wasNearBoundary = lastBox.xMin < boundaryThreshold || 
+                             lastBox.yMin < boundaryThreshold || 
+                             (lastBox.xMax > videoWidth - boundaryThreshold) || 
+                             (lastBox.yMax > videoHeight - boundaryThreshold);
+        }
+
         if (!faces || faces.length === 0) {
-          if (faceMissingStartRef.current === null) {
-            faceMissingStartRef.current = Date.now();
-          }
-          const missingSec = (Date.now() - faceMissingStartRef.current) / 1000;
-          
-          debug("Face Missing Timer", { missingSec, threshold: DETECTION_CONFIG.FACE_MISSING_THRESHOLD_MS / 1000 });
-          
-          if (missingSec >= DETECTION_CONFIG.FACE_MISSING_THRESHOLD_MS / 1000) {
-            currentFaceWarning = "Face Missing from Frame";
-            triggerViolation("Face Missing from Frame", screenshot);
+          // No face detected by FaceMesh. Check if it's partially hidden or fully missing.
+          if (wasNearBoundary || hasPerson) {
+            // Face is partially visible or recently drifted near boundary
+            faceMissingStartRef.current = null;
+            currentFaceWarning = "Face Partially Hidden";
+            triggerViolation("Face Partially Hidden", screenshot);
+          } else {
+            // Face is completely missing from the frame
+            if (faceMissingStartRef.current === null) {
+              faceMissingStartRef.current = Date.now();
+            }
+            const missingSec = (Date.now() - faceMissingStartRef.current) / 1000;
+            
+            debug("Face Missing Timer", { missingSec, threshold: DETECTION_CONFIG.FACE_MISSING_THRESHOLD_MS / 1000 });
+            
+            if (missingSec >= DETECTION_CONFIG.FACE_MISSING_THRESHOLD_MS / 1000) {
+              currentFaceWarning = "Face Missing from Frame";
+              triggerViolation("Face Missing from Frame", screenshot);
+            }
           }
         } else {
           faceMissingStartRef.current = null;
@@ -259,8 +320,12 @@ export default function InterviewScreen() {
 
           const mainFace = faces[0];
           const bbox = mainFace.box;
-          const videoWidth = video.videoWidth || 640;
-          const videoHeight = video.videoHeight || 480;
+
+          // Update boundary memory
+          lastFaceBoxRef.current = {
+            box: bbox,
+            timestamp: Date.now()
+          };
 
           const margin = 40;
           const isOffScreen = bbox.xMin < margin || 
@@ -354,34 +419,6 @@ export default function InterviewScreen() {
               remTrackingRef.current.lastValue = avgGaze;
             }
           }
-        }
-
-        // YOLOv8 object detection with retry logic
-        try {
-          if (screenshot) {
-            const res = await fetch("http://localhost:3000/api/detect-objects", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ screenshot_base64: screenshot })
-            });
-            if (res.ok) {
-              const data = await res.json();
-              if (data.status === "success" && data.detected) {
-                debug("Object Detection", { detected: data.detected });
-                const hasPhone = data.detected.some((className: string) => 
-                  className.toLowerCase().includes("cell phone") || 
-                  className.toLowerCase().includes("phone") ||
-                  className.toLowerCase().includes("book")
-                );
-                if (hasPhone) {
-                  currentBlurWarning = "Cell Phone Detected";
-                  triggerViolation("Cell Phone Detected", screenshot);
-                }
-              }
-            }
-          }
-        } catch (phoneErr) {
-          debug("Object Detection Error", phoneErr);
         }
 
         setFaceWarning(currentFaceWarning);
