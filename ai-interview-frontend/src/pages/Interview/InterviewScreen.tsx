@@ -28,11 +28,11 @@ const DETECTION_CONFIG = {
 };
 
 export default function InterviewScreen() {
-  const [isMuted, setIsMuted] = useState(false);
-  const [isAiSpeaking, setIsAiSpeaking] = useState(false);
-  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
-  const [isVideoOn, setIsVideoOn] = useState(true);
-  const [timeLeft, setTimeLeft] = useState(300);
+  const [isMuted] = useState(false);
+  const [isAiSpeaking] = useState(false);
+  const [isUserSpeaking] = useState(false);
+  const [isVideoOn] = useState(true);
+  const [timeLeft] = useState(300);
   const [isInterviewComplete, setIsInterviewComplete] = useState(false);
   const [reportData, setReportData] = useState<InterviewReportData | null>(null);
   const [isProcessingEnd, setIsProcessingEnd] = useState(false);
